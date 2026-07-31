@@ -1,0 +1,1184 @@
+"""
+Codex Usage Widget
+------------------
+Always-on-top 200x130 tkinter overlay showing OpenAI Codex 5h and weekly quota.
+
+Python 3.11+ on Windows.
+"""
+
+import ctypes
+from ctypes import wintypes
+import json
+import logging
+import os
+import sys
+import threading
+import time
+import tkinter as tk
+from base64 import b64decode
+from datetime import datetime
+from pathlib import Path
+from urllib.request import ProxyHandler, Request, build_opener
+
+from PIL import Image, ImageDraw, ImageFont, ImageTk
+
+try:
+    import pystray
+except ImportError as exc:
+    raise SystemExit(
+        "Missing dependency: pystray. Install it with: pip install pystray pillow"
+    ) from exc
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+AUTH_JSON = CODEX_HOME / "auth.json"
+WIDGET_POS_JSON = CODEX_HOME / "widget_pos.json"
+LOG_PATH = CODEX_HOME / "codex_widget.log"
+INSTANCE_JSON = CODEX_HOME / "codex_widget_instance.json"
+BACKEND_URL = "https://chatgpt.com/backend-api/wham/usage"
+REFRESH_URL = "https://auth.openai.com/oauth/token"
+CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+POLL_SECONDS = 300
+REQUEST_TIMEOUT_SECONDS = 15
+TRAY_DOUBLE_CLICK_SECONDS = 0.35
+_MUTEX_HANDLE = None
+_OWNS_MUTEX = False
+_URL_OPENER = build_opener(ProxyHandler({}))
+
+DARK = "#0b0f18"
+TRANSPARENT = "#ff00ff"
+WHITE = "#f8fafc"
+GREEN = "#6ee7a8"
+YELLOW = "#d6b44a"
+RED = "#ef4444"
+BLUE = "#6fa8ff"
+GOLD = "#d4af37"
+TRACK = "#263244"
+INNER_TRACK = "#1b2435"
+TEXT_DIM = "#9ca3af"
+
+WIDGET_W_BOTH = 200
+WIDGET_W_SINGLE = 110
+WIDGET_H = 130
+CARD_RADIUS = 20
+RENDER_SCALE = 4
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def _console_logging_requested() -> bool:
+    value = os.environ.get("CODEX_WIDGET_CONSOLE", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _console_stream():
+    """Use console logging only when explicitly requested.
+
+    A packaged GUI build must never allocate a terminal window. Logs are always
+    written to codex_widget.log, so a console is unnecessary during normal use.
+    """
+    if not _console_logging_requested():
+        return None
+
+    if os.name == "nt":
+        kernel32 = ctypes.windll.kernel32
+        attached = bool(kernel32.GetConsoleWindow())
+        if not attached:
+            attached = bool(kernel32.AllocConsole())
+        if attached:
+            try:
+                stream = open("CONOUT$", "w", encoding="utf-8", buffering=1)
+                sys.stdout = stream
+                sys.stderr = stream
+                return stream
+            except OSError:
+                return None
+    return sys.stderr
+
+
+def _app_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _setup_logging() -> Path:
+    log_path = LOG_PATH
+    handlers: list[logging.Handler] = []
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
+    except Exception:
+        log_path = _app_dir() / "codex_widget.log"
+        handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
+
+    console = _console_stream()
+    if console is not None:
+        handlers.append(logging.StreamHandler(console))
+
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
+        handlers=handlers,
+        force=True,
+    )
+    logging.info("Logging started at %s", log_path)
+    logging.info(
+        "Console logging requested=%s stream=%s stderr_isatty=%s",
+        _console_logging_requested(),
+        type(console).__name__,
+        bool(getattr(console, "isatty", lambda: False)()) if console else False,
+    )
+    logging.info("Python=%s frozen=%s executable=%s", sys.version, getattr(sys, "frozen", False), sys.executable)
+    logging.info("CODEX_HOME=%s AUTH_JSON=%s INSTANCE_JSON=%s", CODEX_HOME, AUTH_JSON, INSTANCE_JSON)
+    return log_path
+
+
+LOG_FILE = _setup_logging()
+
+
+def _log_unhandled_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    logging.critical("Unhandled exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+
+sys.excepthook = _log_unhandled_exception
+
+if hasattr(threading, "excepthook"):
+    def _log_thread_exception(args):
+        logging.critical(
+            "Unhandled thread exception in %s",
+            args.thread.name if args.thread else "<unknown>",
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    threading.excepthook = _log_thread_exception
+
+
+# ---------------------------------------------------------------------------
+# Single instance
+# ---------------------------------------------------------------------------
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        process_query_limited_information = 0x1000
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            return False
+        kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _read_instance_info() -> dict | None:
+    try:
+        if not INSTANCE_JSON.exists():
+            return None
+        with open(INSTANCE_JSON, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        logging.exception("Failed to read instance metadata from %s.", INSTANCE_JSON)
+        return None
+
+
+def _write_instance_info():
+    try:
+        CODEX_HOME.mkdir(parents=True, exist_ok=True)
+        info = {
+            "pid": os.getpid(),
+            "executable": sys.executable,
+            "frozen": bool(getattr(sys, "frozen", False)),
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "cwd": os.getcwd(),
+            "log_file": str(LOG_FILE),
+        }
+        with open(INSTANCE_JSON, "w", encoding="utf-8") as f:
+            json.dump(info, f, indent=2)
+            f.write("\n")
+        logging.info("Wrote instance metadata: %s.", info)
+    except Exception:
+        logging.exception("Failed to write instance metadata to %s.", INSTANCE_JSON)
+
+
+def _remove_instance_info():
+    if not _OWNS_MUTEX:
+        return
+    try:
+        info = _read_instance_info()
+        if info and int(info.get("pid", -1)) != os.getpid():
+            logging.warning("Not removing instance metadata because it belongs to another pid: %s.", info)
+            return
+        INSTANCE_JSON.unlink(missing_ok=True)
+        logging.info("Removed instance metadata from %s.", INSTANCE_JSON)
+    except Exception:
+        logging.exception("Failed to remove instance metadata from %s.", INSTANCE_JSON)
+
+
+def ensure_single_instance() -> bool:
+    """Return False when another widget process is already running."""
+    global _OWNS_MUTEX
+    if os.name != "nt":
+        logging.debug("Single-instance mutex skipped on non-Windows OS.")
+        _OWNS_MUTEX = True
+        _write_instance_info()
+        return True
+
+    global _MUTEX_HANDLE
+    kernel32 = ctypes.windll.kernel32
+    _MUTEX_HANDLE = kernel32.CreateMutexW(None, True, "CodexUsageWidgetSingleInstance")
+    last_error = kernel32.GetLastError()
+    if last_error == 183:
+        info = _read_instance_info()
+        if info:
+            pid = int(info.get("pid", -1))
+            logging.info(
+                "Another widget instance is already running; exiting. owner_pid=%s pid_running=%s info=%s.",
+                pid,
+                _pid_is_running(pid),
+                info,
+            )
+        else:
+            logging.info(
+                "Another widget instance is already running; exiting. No instance metadata exists yet; "
+                "look for an existing python.exe or codex_widget.exe process."
+            )
+        return False
+    _OWNS_MUTEX = True
+    _write_instance_info()
+    logging.debug("Single-instance mutex acquired; GetLastError=%s.", last_error)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+
+def _is_jwt_expired(token: str, skew: int = 120) -> bool:
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            logging.debug("Access token is not JWT-shaped; skipping expiry check.")
+            return False
+        padding = 4 - len(parts[1]) % 4
+        payload = json.loads(b64decode(parts[1] + "=" * padding).decode("utf-8"))
+        exp = payload.get("exp")
+        if not exp:
+            logging.debug("Access token JWT has no exp claim; skipping expiry check.")
+            return False
+        return exp <= int(time.time()) + skew
+    except Exception:
+        logging.exception("Failed to inspect access token expiry; treating token as not expired.")
+        return False
+
+
+def _read_auth_json():
+    logging.debug("Reading auth file from %s.", AUTH_JSON)
+    if not AUTH_JSON.exists():
+        raise FileNotFoundError(f"auth.json not found at {AUTH_JSON}. Log in to Codex first.")
+    with open(AUTH_JSON, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _write_auth_json(auth: dict):
+    logging.debug("Writing refreshed auth file to %s.", AUTH_JSON)
+    with open(AUTH_JSON, "w", encoding="utf-8") as f:
+        json.dump(auth, f, indent=2)
+        f.write("\n")
+
+
+def _refresh_token(auth: dict) -> str:
+    refresh_token = auth.get("tokens", {}).get("refresh_token")
+    if not refresh_token:
+        raise RuntimeError("No refresh_token found in auth.json.")
+
+    logging.info("Refreshing expired Codex access token.")
+    body = json.dumps({
+        "client_id": CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }).encode("utf-8")
+
+    req = Request(REFRESH_URL, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with _URL_OPENER.open(req, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
+            refreshed = json.load(resp)
+    except TimeoutError:
+        logging.exception("Token refresh timed out after %s seconds.", REQUEST_TIMEOUT_SECONDS)
+        raise
+
+    auth.setdefault("tokens", {})
+    if "access_token" in refreshed:
+        auth["tokens"]["access_token"] = refreshed["access_token"]
+    if "refresh_token" in refreshed:
+        auth["tokens"]["refresh_token"] = refreshed["refresh_token"]
+    auth["last_refresh"] = datetime.utcnow().isoformat()
+    _write_auth_json(auth)
+    logging.info("Access token refreshed successfully.")
+    return auth["tokens"]["access_token"]
+
+
+def get_access_token() -> tuple[str, str | None]:
+    """Returns (access_token, account_id)."""
+    auth = _read_auth_json()
+
+    if not auth.get("tokens", {}).get("access_token"):
+        raise RuntimeError("No access_token in auth.json. Please log in to Codex.")
+
+    token = auth["tokens"]["access_token"]
+    if _is_jwt_expired(token):
+        token = _refresh_token(auth)
+
+    account_id = auth.get("tokens", {}).get("account_id")
+    logging.debug("Loaded access token; account_id_present=%s.", bool(account_id))
+    return token, account_id
+
+
+# ---------------------------------------------------------------------------
+# Codex API
+# ---------------------------------------------------------------------------
+
+def _normalize_window(window: dict | None) -> dict | None:
+    if not window:
+        return None
+
+    used = float(window.get("used_percent", window.get("usedPercent", 0)))
+    used = max(0.0, min(100.0, used))
+    reset_at = window.get("reset_at", window.get("resetAt"))
+    reset_after = window.get("reset_after_seconds", window.get("resetAfterSeconds"))
+    window_secs = window.get("limit_window_seconds", window.get("limitWindowSeconds", 0))
+    window_mins = window.get("window_minutes") or (
+        int(window_secs / 60) if window_secs else None
+    )
+
+    return {
+        "used_percent": used,
+        "remaining_percent": max(0.0, 100.0 - used),
+        "window_minutes": window_mins,
+        "limit_window_seconds": window_secs,
+        "reset_at": reset_at,
+        "reset_after_seconds": reset_after,
+    }
+
+
+def _format_reset(epoch_seconds, include_date: bool) -> str:
+    if not epoch_seconds:
+        return "--/-- --:--" if include_date else "--:--"
+    try:
+        dt = datetime.fromtimestamp(float(epoch_seconds))
+        if include_date:
+            return f"{dt.day:02d}/{dt.month:02d} {dt.strftime('%H:%M')}"
+        return dt.strftime("%H:%M")
+    except Exception:
+        return "--/-- --:--" if include_date else "--:--"
+
+
+def fetch_usage() -> dict:
+    logging.info("Fetching Codex usage from %s.", BACKEND_URL)
+    token, account_id = get_access_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "codex-widget/1.0",
+    }
+    if account_id:
+        headers["ChatGPT-Account-Id"] = account_id
+
+    req = Request(BACKEND_URL, headers=headers)
+    try:
+        with _URL_OPENER.open(req, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
+            logging.debug("Usage response status=%s.", getattr(resp, "status", "<unknown>"))
+            payload = json.load(resp)
+    except TimeoutError:
+        logging.exception("Usage request timed out after %s seconds.", REQUEST_TIMEOUT_SECONDS)
+        raise
+
+    rl = payload.get("rate_limit") or payload.get("rateLimits") or {}
+    raw_primary = _normalize_window(rl.get("primary_window") or rl.get("primary"))
+    raw_secondary = _normalize_window(rl.get("secondary_window") or rl.get("secondary"))
+
+    # Detect weekly-only mode: primary window is 7 days (604800s) and no secondary.
+    # On Pro, primary is the 5h window (~18000s) and secondary is the weekly window.
+    WEEKLY_SECONDS = 604800
+    if (
+        raw_primary is not None
+        and raw_secondary is None
+        and raw_primary.get("limit_window_seconds", 0) >= WEEKLY_SECONDS
+    ):
+        primary = None
+        secondary = raw_primary
+    else:
+        primary = raw_primary
+        secondary = raw_secondary
+
+    status = payload.get("rate_limit_reached_type")
+    if isinstance(status, dict):
+        status = status.get("kind", "OK")
+    status = status or "OK"
+    if status.lower() == "unknown":
+        status = "OK"
+
+    result = {
+        "plan": payload.get("plan_type") or payload.get("planType") or "unknown",
+        "limit_status": status,
+        "primary": primary,
+        "secondary": secondary,
+        "primary_reset_time": _format_reset(primary["reset_at"] if primary else None, True),
+        "secondary_reset_time": _format_reset(secondary["reset_at"] if secondary else None, True),
+        "fetched_at": datetime.now().strftime("%H:%M:%S"),
+    }
+    logging.info(
+        "Usage fetched: plan=%s status=%s primary=%s secondary=%s.",
+        result["plan"],
+        result["limit_status"],
+        primary,
+        secondary,
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Overlay UI
+# ---------------------------------------------------------------------------
+
+def _limit_color(percent_left: float) -> str:
+    if percent_left < 10:
+        return RED
+    if percent_left <= 30:
+        return YELLOW
+    return GREEN
+
+
+def _hex_to_rgba(color: str, alpha: int = 255) -> tuple[int, int, int, int]:
+    color = color.lstrip("#")
+    return int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16), alpha
+
+
+def _font(size: int, bold: bool = False, symbol: bool = False) -> ImageFont.ImageFont:
+    names = []
+    if symbol:
+        names.append(r"C:\Windows\Fonts\seguisym.ttf")
+    names.append(r"C:\Windows\Fonts\segoeuib.ttf" if bold else r"C:\Windows\Fonts\segoeui.ttf")
+    names.append("arialbd.ttf" if bold else "arial.ttf")
+
+    for name in names:
+        try:
+            return ImageFont.truetype(name, size * RENDER_SCALE)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _reset_remaining_percent(window: dict) -> float | None:
+    try:
+        reset_after = float(window["reset_after_seconds"])
+        window_seconds = float(window["limit_window_seconds"])
+        if window_seconds <= 0:
+            return None
+        return max(0.0, min(100.0, (reset_after / window_seconds) * 100.0))
+    except Exception:
+        return None
+
+
+def _load_widget_state() -> dict:
+    try:
+        if not WIDGET_POS_JSON.exists():
+            logging.debug("Widget state file does not exist at %s.", WIDGET_POS_JSON)
+            return {}
+        with open(WIDGET_POS_JSON, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        state = {
+            "x": int(payload["x"]),
+            "y": int(payload["y"]),
+            "locked": bool(payload.get("locked", False)),
+            "always_on_top": bool(payload.get("always_on_top", True)),
+            "display_mode": payload.get("display_mode", "both"),
+        }
+        logging.debug("Loaded widget state: %s.", state)
+        return state
+    except Exception:
+        logging.exception("Failed to load widget state from %s; using defaults.", WIDGET_POS_JSON)
+        return {}
+
+
+def _save_widget_state(x: int, y: int, locked: bool, always_on_top: bool, display_mode: str):
+    try:
+        CODEX_HOME.mkdir(parents=True, exist_ok=True)
+        with open(WIDGET_POS_JSON, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "x": x,
+                    "y": y,
+                    "locked": locked,
+                    "always_on_top": always_on_top,
+                    "display_mode": display_mode,
+                },
+                f,
+            )
+            f.write("\n")
+        logging.debug(
+            "Saved widget state: x=%s y=%s locked=%s always_on_top=%s display_mode=%s.",
+            x,
+            y,
+            locked,
+            always_on_top,
+            display_mode,
+        )
+    except Exception:
+        logging.exception("Failed to save widget state to %s.", WIDGET_POS_JSON)
+        pass
+
+
+def _get_monitor_rects() -> list[tuple[int, int, int, int]]:
+    if os.name != "nt":
+        return []
+
+    rects: list[tuple[int, int, int, int]] = []
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("rcMonitor", RECT),
+            ("rcWork", RECT),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
+    monitor_enum_proc = ctypes.WINFUNCTYPE(
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(RECT),
+        ctypes.c_void_p,
+    )
+
+    def callback(monitor, _hdc, _rect, _data):
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(MONITORINFO)
+        if ctypes.windll.user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            work = info.rcWork
+            rects.append((work.left, work.top, work.right, work.bottom))
+        return 1
+
+    try:
+        ctypes.windll.user32.EnumDisplayMonitors(0, 0, monitor_enum_proc(callback), 0)
+    except Exception:
+        logging.exception("Failed to enumerate monitors.")
+        return []
+
+    logging.debug("Detected monitor work areas: %s.", rects)
+    return rects
+
+
+def _rect_intersects(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+    return a[0] < b[2] and a[2] > b[0] and a[1] < b[3] and a[3] > b[1]
+
+
+def _primary_monitor_rect(root: tk.Tk) -> tuple[int, int, int, int]:
+    for rect in _get_monitor_rects():
+        if rect[0] <= 0 < rect[2] and rect[1] <= 0 < rect[3]:
+            return rect
+    screen_width = root.winfo_screenwidth()
+    screen_height = root.winfo_screenheight()
+    return (0, 0, screen_width, screen_height)
+
+
+def _position_on_available_screen(root: tk.Tk, x: int, y: int, widget_w: int) -> tuple[int, int, bool]:
+    widget_rect = (x, y, x + widget_w, y + WIDGET_H)
+    monitors = _get_monitor_rects()
+    if monitors and any(_rect_intersects(widget_rect, monitor) for monitor in monitors):
+        logging.debug("Saved widget position is visible: x=%s y=%s.", x, y)
+        return x, y, False
+
+    if not monitors:
+        screen_width = root.winfo_screenwidth()
+        screen_height = root.winfo_screenheight()
+        if 0 <= x < screen_width - 24 and 0 <= y < screen_height - 24:
+            logging.debug("Saved widget position is visible using Tk screen bounds: x=%s y=%s.", x, y)
+            return x, y, False
+
+    left, top, right, _bottom = _primary_monitor_rect(root)
+    new_x = max(left + 20, right - widget_w - 24)
+    new_y = top + 24
+    logging.info("Saved widget position is off-screen; moving from (%s, %s) to (%s, %s).", x, y, new_x, new_y)
+    return new_x, new_y, True
+
+
+class CodexOverlay:
+    def __init__(self):
+        logging.info("Initializing CodexOverlay.")
+        self.state = _load_widget_state()
+        self.root = tk.Tk()
+        logging.debug("Tk root created.")
+        self.root.withdraw()
+        self.root.overrideredirect(True)
+        self.always_on_top = bool(self.state.get("always_on_top", True))
+        self.root.wm_attributes("-topmost", self.always_on_top)
+        self.root.configure(bg=TRANSPARENT)
+        try:
+            self.root.wm_attributes("-transparentcolor", TRANSPARENT)
+        except tk.TclError:
+            logging.exception("Transparent color attribute failed; falling back to solid background.")
+            self.root.configure(bg=DARK)
+        self.root.resizable(False, False)
+
+        self.drag_offset_x = 0
+        self.drag_offset_y = 0
+        self.poll_lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.locked = bool(self.state.get("locked", False))
+        self.always_on_top_var = tk.BooleanVar(value=self.always_on_top)
+        self.display_mode = self.state.get("display_mode", "both")
+        if self.display_mode not in {"5h", "weekly", "both"}:
+            self.display_mode = "both"
+        self.display_mode_var = tk.StringVar(value=self.display_mode)
+        self.widget_w = WIDGET_W_BOTH if self.display_mode == "both" else WIDGET_W_SINGLE
+        self.primary_left = None
+        self.weekly_left = None
+        self.primary_time_left = None
+        self.weekly_time_left = None
+        self.primary_reset = "--/-- --:--"
+        self.weekly_reset = "--/-- --:--"
+        self.error = False
+        self.tray_icon = None
+        self.widget_visible = True
+        self.tray_limit_mode = "5h"
+        self.tray_click_lock = threading.Lock()
+        self.tray_click_timer = None
+
+        self._build_ui()
+        self._start_tray_icon()
+        self._restore_position()
+        self.root.deiconify()
+        self._start_polling()
+        logging.info("CodexOverlay initialized.")
+
+    def _build_ui(self):
+        logging.debug("Building widget UI.")
+        self.canvas = tk.Canvas(
+            self.root,
+            width=self.widget_w,
+            height=WIDGET_H,
+            bg=TRANSPARENT,
+            highlightthickness=0,
+            bd=0,
+        )
+        self.canvas.pack(fill="both", expand=True)
+
+        self.menu = tk.Menu(self.root, tearoff=0)
+        self.menu.add_command(label="Refresh now", command=self.refresh_now)
+        self.menu.add_command(label=self._lock_menu_label(), command=self.toggle_lock)
+        self.menu.add_checkbutton(
+            label="Always on top",
+            variable=self.always_on_top_var,
+            command=self.toggle_always_on_top,
+        )
+        display_menu = tk.Menu(self.menu, tearoff=0)
+        display_menu.add_radiobutton(
+            label="Only 5h", value="5h", variable=self.display_mode_var, command=self.change_display_mode
+        )
+        display_menu.add_radiobutton(
+            label="Only weekly", value="weekly", variable=self.display_mode_var, command=self.change_display_mode
+        )
+        display_menu.add_radiobutton(
+            label="Weekly + 5h", value="both", variable=self.display_mode_var, command=self.change_display_mode
+        )
+        self.menu.add_cascade(label="Display", menu=display_menu)
+        self.menu.add_separator()
+        self.menu.add_command(label="Minimize to tray", command=self.minimize_to_tray)
+        self.menu.add_command(label="Quit", command=self.quit)
+
+        self._bind_interactions(self.root)
+        self._bind_interactions(self.canvas)
+        self._draw()
+        logging.debug("Widget UI built.")
+
+    def _lock_menu_label(self) -> str:
+        return "Unlock position" if self.locked else "Lock position"
+
+    def _update_lock_control(self):
+        self.menu.entryconfig(1, label=self._lock_menu_label())
+        self._draw()
+
+    def _bind_interactions(self, widget):
+        widget.bind("<ButtonPress-1>", self._drag_start)
+        widget.bind("<B1-Motion>", self._drag_move)
+        widget.bind("<ButtonRelease-1>", self._drag_end)
+        widget.bind("<Double-Button-1>", self._double_click)
+        widget.bind("<Button-3>", self._show_menu)
+
+    def _double_click(self, _event):
+        """Minimize the floating widget to the system tray."""
+        self.minimize_to_tray()
+
+    def _restore_position(self):
+        self.root.update_idletasks()
+        saved = _load_widget_state()
+        if "x" in saved and "y" in saved:
+            x, y, moved = _position_on_available_screen(self.root, saved["x"], saved["y"], self.widget_w)
+        else:
+            left, top, right, _bottom = _primary_monitor_rect(self.root)
+            x = max(left + 20, right - self.widget_w - 24)
+            y = top + 24
+            moved = True
+        self.root.geometry(f"{self.widget_w}x{WIDGET_H}+{x}+{y}")
+        logging.info("Widget positioned at x=%s y=%s moved=%s.", x, y, moved)
+        if moved:
+            self._save_state()
+
+    def _drag_start(self, event):
+        if self._event_hits_lock(event):
+            self.toggle_lock()
+            return
+        if self.locked:
+            return
+        self.drag_offset_x = event.x_root - self.root.winfo_x()
+        self.drag_offset_y = event.y_root - self.root.winfo_y()
+
+    def _drag_move(self, event):
+        if self.locked:
+            return
+        x = event.x_root - self.drag_offset_x
+        y = event.y_root - self.drag_offset_y
+        self.root.geometry(f"+{x}+{y}")
+
+    def _drag_end(self, event):
+        if self.locked:
+            return
+        self._save_state()
+
+    def _event_hits_lock(self, event) -> bool:
+        return event.x >= self.widget_w - 30 and event.y <= 30
+
+    def toggle_lock(self):
+        self.locked = not self.locked
+        logging.info("Widget lock toggled: locked=%s.", self.locked)
+        self._update_lock_control()
+        self._save_state()
+
+    def toggle_always_on_top(self):
+        self.always_on_top = bool(self.always_on_top_var.get())
+        logging.info("Always-on-top toggled: always_on_top=%s.", self.always_on_top)
+        self.root.wm_attributes("-topmost", self.always_on_top)
+        self._save_state()
+
+    def _save_state(self):
+        _save_widget_state(
+            self.root.winfo_x(),
+            self.root.winfo_y(),
+            self.locked,
+            self.always_on_top,
+            self.display_mode,
+        )
+
+
+    def change_display_mode(self):
+        new_mode = self.display_mode_var.get()
+        if new_mode not in {"5h", "weekly", "both"}:
+            return
+        self.display_mode = new_mode
+        self.widget_w = WIDGET_W_BOTH if new_mode == "both" else WIDGET_W_SINGLE
+        if new_mode == "5h":
+            self.tray_limit_mode = "5h"
+        elif new_mode == "weekly":
+            self.tray_limit_mode = "weekly"
+        self.canvas.config(width=self.widget_w, height=WIDGET_H)
+        self.root.geometry(f"{self.widget_w}x{WIDGET_H}+{self.root.winfo_x()}+{self.root.winfo_y()}")
+        logging.info("Display mode changed: %s.", new_mode)
+        self._save_state()
+        self._draw()
+        if self.tray_icon is not None:
+            self.tray_icon.menu = self._build_tray_menu()
+        self._update_tray_icon()
+
+    def _show_menu(self, event):
+        try:
+            self.menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.menu.grab_release()
+
+    def _make_tray_image(self, value: str, color: str = "#000000") -> Image.Image:
+        """Create a transparent tray icon containing the selected limit marker and value."""
+        size = 256
+        image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+
+        text = str(value)
+        # Use virtually the entire icon. Windows scales this master image down
+        # to the current tray-icon size while preserving crisp edges.
+        font_size = 215 if len(text) <= 2 else 168
+        font = None
+        for name in (r"C:\Windows\Fonts\arialbd.ttf", r"C:\Windows\Fonts\segoeuib.ttf", "arialbd.ttf"):
+            try:
+                font = ImageFont.truetype(name, font_size)
+                break
+            except OSError:
+                continue
+        if font is None:
+            font = ImageFont.load_default()
+
+        bbox = draw.textbbox((0, 0), text, font=font, stroke_width=0)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        x = (size - text_w) / 2 - bbox[0]
+        y = (size - text_h) / 2 - bbox[1]
+        draw.text((x, y), text, fill=(0, 0, 0, 255), font=font)
+
+        return image
+
+    def _build_tray_menu(self):
+        if self.display_mode == "both":
+            items = [
+                pystray.MenuItem("Toggle 5h / Weekly", self._tray_click, default=True),
+                pystray.MenuItem("Maximize", self._tray_maximize),
+            ]
+        else:
+            items = [pystray.MenuItem("Maximize", self._tray_maximize, default=True)]
+        return pystray.Menu(
+            *items,
+            pystray.MenuItem("Refresh now", self._tray_refresh),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Exit", self._tray_quit),
+        )
+
+    def _start_tray_icon(self):
+        logging.info("Starting system tray icon.")
+        self.tray_icon = pystray.Icon(
+            "CodexUsageWidget",
+            self._make_tray_image("--"),
+            "5h limit : --% | reset --/-- --:--\nWeekly limit : --% | reset --/-- --:--",
+            self._build_tray_menu(),
+        )
+        self.tray_icon.run_detached()
+
+    def _update_tray_icon(self):
+        if self.tray_icon is None:
+            return
+
+        if self.error:
+            value = "!"
+            color = "#000000"
+            if self.display_mode == "5h":
+                title = "5h limit : error | reset --/-- --:--"
+            elif self.display_mode == "weekly":
+                title = "Weekly limit : error | reset --/-- --:--"
+            else:
+                title = "5h limit : error | reset --/-- --:--\nWeekly limit : error | reset --/-- --:--"
+        else:
+            primary_value = "--" if self.primary_left is None else str(int(round(float(self.primary_left))))
+            weekly_value = "--" if self.weekly_left is None else str(int(round(float(self.weekly_left))))
+            if self.display_mode == "5h":
+                value = primary_value
+                title = f"5h limit : {primary_value}% | reset {self.primary_reset}"
+            elif self.display_mode == "weekly":
+                value = weekly_value
+                title = f"Weekly limit : {weekly_value}% | reset {self.weekly_reset}"
+            else:
+                value = primary_value if self.tray_limit_mode == "5h" else weekly_value
+                title = (
+                    f"5h limit : {primary_value}% | reset {self.primary_reset}\n"
+                    f"Weekly limit : {weekly_value}% | reset {self.weekly_reset}"
+                )
+            color = "#000000"
+
+        try:
+            self.tray_icon.icon = self._make_tray_image(value, color)
+            self.tray_icon.title = title
+        except Exception:
+            logging.exception("Failed to update tray icon.")
+
+    def _tray_toggle_limit(self, _icon=None, _item=None):
+        if self.display_mode != "both":
+            return
+        self.tray_limit_mode = "weekly" if self.tray_limit_mode == "5h" else "5h"
+        logging.info("Tray limit display toggled: mode=%s.", self.tray_limit_mode)
+        self._update_tray_icon()
+
+    def _tray_click(self, _icon=None, _item=None):
+        """Treat one click as a toggle and two quick clicks as maximize."""
+        with self.tray_click_lock:
+            if self.tray_click_timer is not None and self.tray_click_timer.is_alive():
+                self.tray_click_timer.cancel()
+                self.tray_click_timer = None
+                double_click = True
+            else:
+                self.tray_click_timer = threading.Timer(
+                    TRAY_DOUBLE_CLICK_SECONDS,
+                    self._tray_single_click,
+                )
+                self.tray_click_timer.daemon = True
+                self.tray_click_timer.start()
+                double_click = False
+
+        if double_click:
+            self.root.after(0, self.maximize_from_tray)
+
+    def _tray_single_click(self):
+        with self.tray_click_lock:
+            self.tray_click_timer = None
+        if self.display_mode == "both":
+            self._tray_toggle_limit()
+
+    def _tray_maximize(self, _icon=None, _item=None):
+        self.root.after(0, self.maximize_from_tray)
+
+    def _tray_refresh(self, _icon=None, _item=None):
+        self.root.after(0, self.refresh_now)
+
+    def _tray_quit(self, _icon=None, _item=None):
+        self.root.after(0, self.quit)
+
+    def minimize_to_tray(self):
+        logging.info("Minimizing widget to tray.")
+        self._save_state()
+        self.widget_visible = False
+        self.root.withdraw()
+
+    def maximize_from_tray(self):
+        logging.info("Restoring widget from tray.")
+        self.widget_visible = True
+        self.root.deiconify()
+        self.root.lift()
+        if self.always_on_top:
+            self.root.wm_attributes("-topmost", True)
+        self.root.after(100, lambda: self.root.wm_attributes("-topmost", self.always_on_top))
+
+    def _set_loading(self):
+        self.error = False
+        self.primary_left = None
+        self.weekly_left = None
+        self.primary_time_left = None
+        self.weekly_time_left = None
+        self.primary_reset = "--/-- --:--"
+        self.weekly_reset = "--/-- --:--"
+        self._draw()
+        self._update_tray_icon()
+
+    def _apply_data(self, data: dict):
+        logging.debug("Applying usage data to UI: %s.", data)
+        primary = data.get("primary") or {}
+        secondary = data.get("secondary") or {}
+        primary_left = primary.get("remaining_percent")
+        weekly_left = secondary.get("remaining_percent")
+
+        # Both missing -- genuine error
+        if primary_left is None and weekly_left is None:
+            logging.error("Usage payload had no primary or weekly remaining percent: %s.", data)
+            self._apply_error()
+            return
+
+        self.error = False
+        self.primary_left = primary_left
+        self.weekly_left = weekly_left
+        self.primary_time_left = _reset_remaining_percent(primary) if primary else None
+        self.weekly_time_left = _reset_remaining_percent(secondary) if secondary else None
+        self.primary_reset = data.get("primary_reset_time", "--/-- --:--")
+        self.weekly_reset = data.get("secondary_reset_time", "--/-- --:--")
+        self._draw()
+        self._update_tray_icon()
+
+    def _apply_error(self):
+        logging.info("Showing error state in widget.")
+        self.error = True
+        self._draw()
+        self._update_tray_icon()
+
+    def _draw_meter_image(
+        self,
+        draw: ImageDraw.ImageDraw,
+        cx: int,
+        cy: int,
+        percent: float | None,
+        time_percent: float | None,
+        title: str,
+        reset_text: str,
+        color: str,
+    ):
+        s = RENDER_SCALE
+        value = 0.0 if percent is None else max(0.0, min(100.0, float(percent)))
+        time_value = 0.0 if time_percent is None else max(0.0, min(100.0, float(time_percent)))
+        quota_arc_end = -90 + value * 3.6
+        time_arc_end = -90 + time_value * 3.6
+
+        title_font = _font(10, bold=True)
+        percent_font = _font(23, bold=True)
+        reset_font = _font(8, bold=True)
+
+        draw.text((cx * s, 16 * s), title, fill=_hex_to_rgba(TEXT_DIM), font=title_font, anchor="mm")
+
+        outer_r = 38
+        inner_r = 27
+        outer = tuple(v * s for v in (cx - outer_r, cy - outer_r, cx + outer_r, cy + outer_r))
+        inner = tuple(v * s for v in (cx - inner_r, cy - inner_r, cx + inner_r, cy + inner_r))
+
+        draw.arc(outer, start=0, end=359, fill=_hex_to_rgba(TRACK), width=7 * s)
+        draw.arc(outer, start=-90, end=quota_arc_end, fill=_hex_to_rgba(color), width=7 * s)
+        draw.arc(inner, start=0, end=359, fill=_hex_to_rgba(INNER_TRACK), width=4 * s)
+        draw.arc(inner, start=-90, end=time_arc_end, fill=_hex_to_rgba(GOLD), width=4 * s)
+
+        text = "--%" if percent is None else f"{value:.0f}%"
+        draw.text((cx * s, (cy + 1) * s), text, fill=_hex_to_rgba(WHITE), font=percent_font, anchor="mm")
+        draw.text((cx * s, 115 * s), f"Reset {reset_text}", fill=_hex_to_rgba(TEXT_DIM), font=reset_font, anchor="mm")
+
+    def _draw(self):
+        self.canvas.delete("all")
+
+        s = RENDER_SCALE
+        image = Image.new("RGBA", (self.widget_w * s, WIDGET_H * s), _hex_to_rgba(DARK))
+        draw = ImageDraw.Draw(image)
+
+        lock_text = "●" if self.locked else "○"
+        lock_color = GREEN if self.locked else TEXT_DIM
+        draw.text(
+            ((self.widget_w - 13) * s, 13 * s),
+            lock_text,
+            fill=_hex_to_rgba(lock_color),
+            font=_font(8, bold=True, symbol=True),
+            anchor="mm",
+        )
+
+        if self.error:
+            draw.text(
+                ((self.widget_w // 2) * s, (WIDGET_H // 2) * s),
+                "ERR",
+                fill=_hex_to_rgba(RED),
+                font=_font(24, bold=True),
+                anchor="mm",
+            )
+            self._show_rendered(image)
+            return
+
+        primary_color = BLUE if self.primary_left is None else _limit_color(self.primary_left)
+        weekly_color = BLUE if self.weekly_left is None or self.weekly_left > 30 else _limit_color(self.weekly_left)
+        if self.display_mode in {"5h", "both"}:
+            self._draw_meter_image(
+                draw,
+                55,
+                66,
+                self.primary_left,
+                self.primary_time_left,
+                "5h",
+                self.primary_reset,
+                primary_color,
+            )
+        if self.display_mode == "weekly":
+            weekly_cx = 55
+        else:
+            weekly_cx = 145
+        if self.display_mode in {"weekly", "both"}:
+            self._draw_meter_image(
+                draw,
+                weekly_cx,
+                66,
+                self.weekly_left,
+                self.weekly_time_left,
+                "Weekly",
+                self.weekly_reset,
+                weekly_color,
+            )
+
+        self._show_rendered(image)
+
+    def _show_rendered(self, image: Image.Image):
+        image = image.resize((self.widget_w, WIDGET_H), Image.Resampling.LANCZOS).convert("RGB")
+        keyed = Image.new("RGB", (self.widget_w, WIDGET_H), _hex_to_rgba(TRANSPARENT)[:3])
+        mask = Image.new("L", (self.widget_w, WIDGET_H), 0)
+        mask_draw = ImageDraw.Draw(mask)
+        mask_draw.rounded_rectangle(
+            (3, 3, self.widget_w - 3, WIDGET_H - 3),
+            radius=CARD_RADIUS,
+            fill=255,
+        )
+        keyed.paste(image, (0, 0), mask)
+        self.rendered_image = ImageTk.PhotoImage(keyed)
+        self.canvas.create_image(0, 0, image=self.rendered_image, anchor="nw")
+
+    def refresh_now(self):
+        logging.info("Manual refresh requested.")
+        threading.Thread(target=self._poll_once, name="manual-refresh", daemon=True).start()
+
+    def _start_polling(self):
+        logging.info("Starting polling thread; interval=%s seconds.", POLL_SECONDS)
+        self._set_loading()
+        threading.Thread(target=self._poll_loop, name="usage-poll", daemon=True).start()
+
+    def _poll_loop(self):
+        logging.debug("Polling loop started.")
+        self._poll_once()
+        while not self.stop_event.wait(POLL_SECONDS):
+            self._poll_once()
+        logging.debug("Polling loop stopped.")
+
+    def _poll_once(self):
+        if not self.poll_lock.acquire(blocking=False):
+            logging.debug("Skipping poll because another poll is already running.")
+            return
+        try:
+            logging.debug("Poll started.")
+            data = fetch_usage()
+            self.root.after(0, lambda data=data: self._apply_data(data))
+        except Exception:
+            logging.exception("Usage poll failed.")
+            self.root.after(0, self._apply_error)
+        finally:
+            self.poll_lock.release()
+            logging.debug("Poll finished.")
+
+    def quit(self):
+        logging.info("Quit requested.")
+        self.stop_event.set()
+        with self.tray_click_lock:
+            if self.tray_click_timer is not None:
+                self.tray_click_timer.cancel()
+                self.tray_click_timer = None
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                logging.exception("Failed to stop tray icon cleanly.")
+            self.tray_icon = None
+        self.root.destroy()
+
+    def run(self):
+        logging.info("Entering Tk mainloop.")
+        self.root.mainloop()
+        logging.info("Tk mainloop exited.")
+
+
+def main():
+    logging.info("codex_widget startup begins.")
+    try:
+        if not ensure_single_instance():
+            sys.exit(0)
+        CodexOverlay().run()
+    except Exception:
+        logging.critical("Fatal startup/runtime exception.", exc_info=True)
+        raise
+    finally:
+        _remove_instance_info()
+        logging.info("codex_widget process exiting.")
+
+
+if __name__ == "__main__":
+    main()
