@@ -2,11 +2,11 @@
 
 A lightweight Windows widget that shows your remaining **Codex 5-hour** and **weekly usage** on the desktop and in the Windows system tray.
 
-![Codex Usage Widget](widget.png)
+<img width="189" height="124" alt="006705-20260731-132718-tk" src="https://github.com/user-attachments/assets/ea54b76f-69a9-41f9-8ade-5213d24997db" />
 
 The tray icon shows the currently selected remaining percentage:
 
-![Codex Usage Widget tray icon](tray.png)
+<img width="39" height="41" alt="006706-20260731-132724-" src="https://github.com/user-attachments/assets/6eb63a03-622c-42f7-9150-a95c7367bcb3" />
 
 > This is an unofficial community project and is not affiliated with or endorsed by OpenAI.
 
