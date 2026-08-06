@@ -42,6 +42,11 @@ BACKEND_URL = "https://chatgpt.com/backend-api/wham/usage"
 REFRESH_URL = "https://auth.openai.com/oauth/token"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 POLL_SECONDS = 300
+ACTIVITY_POLL_SECONDS = 2
+ACTIVITY_DISCOVERY_SECONDS = 5
+ACTIVITY_BUSY_SECONDS = 30
+ACTIVITY_SESSION_LOOKBACK_SECONDS = 6 * 60 * 60
+ACTIVITY_MAX_SESSION_FILES = 40
 REQUEST_TIMEOUT_SECONDS = 15
 TRAY_DOUBLE_CLICK_SECONDS = 0.35
 _MUTEX_HANDLE = None
@@ -59,6 +64,38 @@ GOLD = "#d4af37"
 TRACK = "#263244"
 INNER_TRACK = "#1b2435"
 TEXT_DIM = "#9ca3af"
+
+ACTIVITY_WORKING = "working"
+ACTIVITY_READY = "ready"
+ACTIVITY_CLOSED = "closed"
+ACTIVITY_ERROR = "error"
+
+_ACTIVITY_WORKING_EVENT_TYPES = {
+    "agent_message",
+    "agent_reasoning",
+    "custom_tool_call",
+    "custom_tool_call_output",
+    "function_call",
+    "function_call_output",
+    "reasoning",
+    "task_started",
+    "tool_call",
+    "tool_call_start",
+    "turn_started",
+    "user_message",
+}
+_ACTIVITY_COMPLETED_EVENT_TYPES = {
+    "task_complete",
+    "task_completed",
+    "turn_aborted",
+    "turn_complete",
+    "turn_completed",
+}
+_ACTIVITY_WAITING_EVENT_TYPES = {
+    "approval_requested",
+    "request_user_input",
+    "user_input_requested",
+}
 
 WIDGET_W_BOTH = 200
 WIDGET_W_SINGLE = 110
@@ -625,6 +662,203 @@ def _position_on_available_screen(root: tk.Tk, x: int, y: int, widget_w: int) ->
     return new_x, new_y, True
 
 
+# ---------------------------------------------------------------------------
+# Codex activity detection
+# ---------------------------------------------------------------------------
+
+def _codex_process_is_running() -> bool:
+    """Return whether the Codex desktop app, ChatGPT app, or Codex CLI is open."""
+    if os.name != "nt":
+        return False
+
+    th32cs_snapprocess = 0x00000002
+    invalid_handle_value = ctypes.c_void_p(-1).value
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    snapshot = kernel32.CreateToolhelp32Snapshot(th32cs_snapprocess, 0)
+    if snapshot == invalid_handle_value:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            error = ctypes.get_last_error()
+            if error == 18:  # ERROR_NO_MORE_FILES
+                return False
+            raise ctypes.WinError(error)
+
+        while True:
+            if entry.szExeFile.lower() in {"codex.exe", "chatgpt.exe"}:
+                return True
+            if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                error = ctypes.get_last_error()
+                if error != 18:
+                    raise ctypes.WinError(error)
+                return False
+    finally:
+        kernel32.CloseHandle(snapshot)
+
+
+def _parse_event_timestamp(value) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _classify_codex_event(root: dict) -> tuple[str, float | None] | None:
+    """Classify one Codex transcript row as working, waiting, or completed."""
+    payload = root.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+
+    event_type = payload.get("type") or root.get("type")
+    if not isinstance(event_type, str):
+        return None
+    event_type = event_type.lower()
+
+    phase = payload.get("phase") or root.get("phase")
+    phase = phase.lower() if isinstance(phase, str) else ""
+    status = payload.get("status") or payload.get("state") or root.get("status")
+    status = status.lower() if isinstance(status, str) else ""
+    name = payload.get("name")
+    name = name.lower() if isinstance(name, str) else ""
+    timestamp = _parse_event_timestamp(root.get("timestamp"))
+
+    if (
+        event_type in _ACTIVITY_COMPLETED_EVENT_TYPES
+        or phase == "final_answer"
+        or status in {"complete", "completed", "failed", "cancelled", "canceled"}
+    ):
+        return ACTIVITY_READY, timestamp
+
+    if (
+        event_type in _ACTIVITY_WAITING_EVENT_TYPES
+        or name in {"request_user_input", "ask_user", "ask_user_question"}
+        or status in {"waiting", "awaiting_approval", "needs_input"}
+    ):
+        return ACTIVITY_READY, timestamp
+
+    if event_type in _ACTIVITY_WORKING_EVENT_TYPES:
+        return ACTIVITY_WORKING, timestamp
+
+    if event_type == "message" and payload.get("role") == "assistant":
+        return ACTIVITY_WORKING, timestamp
+
+    return None
+
+
+def _latest_session_activity(path: Path) -> tuple[str, float] | None:
+    """Read only the tail of a live JSONL transcript and return its latest useful event."""
+    file_mtime = path.stat().st_mtime
+    with open(path, "rb") as transcript:
+        transcript.seek(0, os.SEEK_END)
+        size = transcript.tell()
+        start = max(0, size - 131_072)
+        transcript.seek(start)
+        data = transcript.read().decode("utf-8", errors="ignore")
+
+    lines = data.splitlines()
+    if start and lines:
+        lines = lines[1:]
+
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            root = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(root, dict):
+            continue
+        classified = _classify_codex_event(root)
+        if classified is not None:
+            status, timestamp = classified
+            return status, timestamp if timestamp is not None else file_mtime
+    return None
+
+
+class CodexActivityScanner:
+    def __init__(self):
+        self._session_files: list[Path] = []
+        self._last_discovery = 0.0
+
+    def _discover_session_files(self, now: float) -> None:
+        sessions_dir = CODEX_HOME / "sessions"
+        if not sessions_dir.exists():
+            self._session_files = []
+            self._last_discovery = time.monotonic()
+            return
+
+        cutoff = now - ACTIVITY_SESSION_LOOKBACK_SECONDS
+        candidates: list[tuple[float, Path]] = []
+        for path in sessions_dir.rglob("*.jsonl"):
+            try:
+                modified = path.stat().st_mtime
+            except OSError:
+                continue
+            if modified >= cutoff:
+                candidates.append((modified, path))
+        candidates.sort(reverse=True)
+        self._session_files = [path for _modified, path in candidates[:ACTIVITY_MAX_SESSION_FILES]]
+        self._last_discovery = time.monotonic()
+
+    def scan(self) -> str:
+        if not _codex_process_is_running():
+            self._session_files = []
+            self._last_discovery = 0.0
+            return ACTIVITY_CLOSED
+
+        now = time.time()
+        if time.monotonic() - self._last_discovery >= ACTIVITY_DISCOVERY_SECONDS:
+            self._discover_session_files(now)
+
+        readable = 0
+        read_errors = 0
+        for path in self._session_files:
+            try:
+                activity = _latest_session_activity(path)
+                readable += 1
+            except OSError:
+                read_errors += 1
+                continue
+            if activity is None:
+                continue
+            status, occurred_at = activity
+            if status == ACTIVITY_WORKING and now - occurred_at <= ACTIVITY_BUSY_SECONDS:
+                return ACTIVITY_WORKING
+
+        if self._session_files and not readable and read_errors:
+            raise OSError("Codex session transcripts could not be read")
+        return ACTIVITY_READY
+
+
 class CodexOverlay:
     def __init__(self):
         logging.info("Initializing CodexOverlay.")
@@ -661,6 +895,8 @@ class CodexOverlay:
         self.primary_reset = "--/-- --:--"
         self.weekly_reset = "--/-- --:--"
         self.error = False
+        self.activity_status = ACTIVITY_CLOSED
+        self.activity_scanner = CodexActivityScanner()
         self.tray_icon = None
         self.widget_visible = True
         self.tray_limit_mode = "5h"
@@ -671,6 +907,7 @@ class CodexOverlay:
         self._start_tray_icon()
         self._restore_position()
         self.root.deiconify()
+        self._start_activity_monitor()
         self._start_polling()
         logging.info("CodexOverlay initialized.")
 
@@ -687,8 +924,11 @@ class CodexOverlay:
         self.canvas.pack(fill="both", expand=True)
 
         self.menu = tk.Menu(self.root, tearoff=0)
+        self.menu.add_command(label=self._activity_menu_label(), state="disabled")
+        self.activity_menu_index = self.menu.index("end")
         self.menu.add_command(label="Refresh now", command=self.refresh_now)
         self.menu.add_command(label=self._lock_menu_label(), command=self.toggle_lock)
+        self.lock_menu_index = self.menu.index("end")
         self.menu.add_checkbutton(
             label="Always on top",
             variable=self.always_on_top_var,
@@ -717,9 +957,17 @@ class CodexOverlay:
     def _lock_menu_label(self) -> str:
         return "Unlock position" if self.locked else "Lock position"
 
+    def _activity_menu_label(self) -> str:
+        labels = {
+            ACTIVITY_WORKING: "Codex activity: Running",
+            ACTIVITY_READY: "Codex activity: Ready",
+            ACTIVITY_CLOSED: "Codex activity: Not detected",
+            ACTIVITY_ERROR: "Codex activity: Detection error",
+        }
+        return labels[self.activity_status]
+
     def _update_lock_control(self):
-        self.menu.entryconfig(1, label=self._lock_menu_label())
-        self._draw()
+        self.menu.entryconfig(self.lock_menu_index, label=self._lock_menu_label())
 
     def _bind_interactions(self, widget):
         widget.bind("<ButtonPress-1>", self._drag_start)
@@ -748,9 +996,6 @@ class CodexOverlay:
             self._save_state()
 
     def _drag_start(self, event):
-        if self._event_hits_lock(event):
-            self.toggle_lock()
-            return
         if self.locked:
             return
         self.drag_offset_x = event.x_root - self.root.winfo_x()
@@ -768,14 +1013,37 @@ class CodexOverlay:
             return
         self._save_state()
 
-    def _event_hits_lock(self, event) -> bool:
-        return event.x >= self.widget_w - 30 and event.y <= 30
-
     def toggle_lock(self):
         self.locked = not self.locked
         logging.info("Widget lock toggled: locked=%s.", self.locked)
         self._update_lock_control()
         self._save_state()
+
+    def _apply_activity_status(self, status: str):
+        if status == self.activity_status:
+            return
+        logging.info("Codex activity changed: %s -> %s.", self.activity_status, status)
+        self.activity_status = status
+        self.menu.entryconfig(self.activity_menu_index, label=self._activity_menu_label())
+        self._draw()
+
+    def _start_activity_monitor(self):
+        logging.info("Starting Codex activity monitor; interval=%s seconds.", ACTIVITY_POLL_SECONDS)
+        threading.Thread(target=self._activity_loop, name="activity-monitor", daemon=True).start()
+
+    def _activity_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                status = self.activity_scanner.scan()
+            except Exception:
+                logging.exception("Codex activity scan failed.")
+                status = ACTIVITY_ERROR
+            try:
+                self.root.after(0, lambda status=status: self._apply_activity_status(status))
+            except (RuntimeError, tk.TclError):
+                return
+            if self.stop_event.wait(ACTIVITY_POLL_SECONDS):
+                return
 
     def toggle_always_on_top(self):
         self.always_on_top = bool(self.always_on_top_var.get())
@@ -1048,15 +1316,19 @@ class CodexOverlay:
         image = Image.new("RGBA", (self.widget_w * s, WIDGET_H * s), _hex_to_rgba(DARK))
         draw = ImageDraw.Draw(image)
 
-        lock_text = "●" if self.locked else "○"
-        lock_color = GREEN if self.locked else TEXT_DIM
-        draw.text(
-            ((self.widget_w - 13) * s, 13 * s),
-            lock_text,
-            fill=_hex_to_rgba(lock_color),
-            font=_font(8, bold=True, symbol=True),
-            anchor="mm",
-        )
+        dot_x = (self.widget_w - 13) * s
+        dot_y = 13 * s
+        dot_r = 4 * s
+        dot_bounds = (dot_x - dot_r, dot_y - dot_r, dot_x + dot_r, dot_y + dot_r)
+        activity_colors = {
+            ACTIVITY_WORKING: YELLOW,
+            ACTIVITY_READY: GREEN,
+            ACTIVITY_ERROR: RED,
+        }
+        if self.activity_status == ACTIVITY_CLOSED:
+            draw.ellipse(dot_bounds, outline=_hex_to_rgba(TEXT_DIM), width=max(1, s))
+        else:
+            draw.ellipse(dot_bounds, fill=_hex_to_rgba(activity_colors[self.activity_status]))
 
         if self.error:
             draw.text(

@@ -19,6 +19,7 @@ The tray icon shows the currently selected remaining percentage:
 - System tray percentage
 - Automatic refresh every 1 minutes
 - Manual refresh
+- Live Codex activity indicator
 - Lockable widget position
 - Remembers its position and settings
 - Prevents multiple copies from running simultaneously
@@ -121,11 +122,13 @@ The script automatically:
 3. Runs PyInstaller inside the virtual environment
 4. Builds the standalone EXE
 
-The finished file is created here:
+The finished file is moved to the repository root:
 
 ```text
-dist\CodexWeeklyWidget.exe
+CodexWeeklyWidget.exe
 ```
+
+The temporary `dist`, `build`, and `CodexWeeklyWidget.spec` artifacts are removed after a successful build.
 
 You do **not** need to activate the virtual environment or install PyInstaller manually when using this method.
 
@@ -176,7 +179,15 @@ dist\CodexWeeklyWidget.exe
 | Left-click and drag | Move the widget |
 | Double-click | Minimize to the system tray |
 | Right-click | Open the widget menu |
-| Click the small circle | Lock or unlock the position |
+
+The top-right activity indicator shows:
+
+- **Yellow dot:** at least one Codex task appears to be running
+- **Green dot:** Codex is open and ready for another prompt
+- **Gray outline:** Codex is closed or could not be detected
+- **Red dot:** activity detection failed
+
+Activity is inferred every two seconds from running `Codex.exe`/`ChatGPT.exe` processes and recent local Codex session events. It is a best-effort signal; a long task that writes no transcript event for more than 30 seconds can briefly appear ready.
 
 ## Right-click menu
 

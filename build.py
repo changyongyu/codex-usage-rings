@@ -7,12 +7,14 @@ The script automatically:
 1. Creates .venv if needed.
 2. Installs requirements.txt inside the virtual environment.
 3. Runs PyInstaller.
-4. Creates dist\CodexWeeklyWidget.exe.
+4. Places CodexWeeklyWidget.exe in the repository root.
+5. Removes PyInstaller's dist, build, and spec artifacts.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -24,7 +26,11 @@ ICON = ROOT / "codex.ico"
 REQUIREMENTS = ROOT / "requirements.txt"
 VENV_DIR = ROOT / ".venv"
 VENV_PYTHON = VENV_DIR / "Scripts" / "python.exe"
-OUTPUT_EXE = ROOT / "dist" / "CodexWeeklyWidget.exe"
+DIST_DIR = ROOT / "dist"
+BUILD_DIR = ROOT / "build"
+SPEC_FILE = ROOT / "CodexWeeklyWidget.spec"
+BUILT_EXE = DIST_DIR / "CodexWeeklyWidget.exe"
+OUTPUT_EXE = ROOT / "CodexWeeklyWidget.exe"
 INSIDE_VENV_FLAG = "--inside-venv"
 
 
@@ -94,13 +100,19 @@ def build_exe() -> None:
     print("\nBuilding CodexWeeklyWidget.exe...")
     run(command)
 
-    if not OUTPUT_EXE.exists():
+    if not BUILT_EXE.exists():
         raise SystemExit(
             "Build finished, but the expected EXE was not found:\n"
-            f"{OUTPUT_EXE}"
+            f"{BUILT_EXE}"
         )
 
+    os.replace(BUILT_EXE, OUTPUT_EXE)
     size_mb = OUTPUT_EXE.stat().st_size / (1024 * 1024)
+    if DIST_DIR.exists():
+        shutil.rmtree(DIST_DIR)
+    if BUILD_DIR.exists():
+        shutil.rmtree(BUILD_DIR)
+    SPEC_FILE.unlink(missing_ok=True)
 
     print("\nBuild complete!")
     print(f"EXE:  {OUTPUT_EXE}")
