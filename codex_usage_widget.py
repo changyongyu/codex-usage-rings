@@ -1,7 +1,8 @@
 """
 Codex Usage Widget
 ------------------
-Always-on-top 200x130 tkinter overlay showing OpenAI Codex 5h and weekly quota.
+Always-on-top desktop card for Codex 5h, weekly, and monthly allowances.
+Default double-meter display: 250x268 px; launched via Windows Task Scheduler.
 
 Python 3.11+ on Windows.
 """
@@ -15,10 +16,8 @@ import sys
 import threading
 import time
 import tkinter as tk
-from base64 import b64decode
 from datetime import datetime
 from pathlib import Path
-from urllib.request import ProxyHandler, Request, build_opener
 
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
@@ -34,36 +33,30 @@ except ImportError as exc:
 # ---------------------------------------------------------------------------
 
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
-AUTH_JSON = CODEX_HOME / "auth.json"
 WIDGET_POS_JSON = CODEX_HOME / "widget_pos.json"
 LOG_PATH = CODEX_HOME / "codex_widget.log"
 INSTANCE_JSON = CODEX_HOME / "codex_widget_instance.json"
-BACKEND_URL = "https://chatgpt.com/backend-api/wham/usage"
-REFRESH_URL = "https://auth.openai.com/oauth/token"
-CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-POLL_SECONDS = 300
+POLL_SECONDS = 60
 ACTIVITY_POLL_SECONDS = 2
 ACTIVITY_DISCOVERY_SECONDS = 5
 ACTIVITY_BUSY_SECONDS = 30
 ACTIVITY_SESSION_LOOKBACK_SECONDS = 6 * 60 * 60
 ACTIVITY_MAX_SESSION_FILES = 40
-REQUEST_TIMEOUT_SECONDS = 15
 TRAY_DOUBLE_CLICK_SECONDS = 0.35
 _MUTEX_HANDLE = None
 _OWNS_MUTEX = False
-_URL_OPENER = build_opener(ProxyHandler({}))
 
-DARK = "#0b0f18"
+DARK = "#111820"
 TRANSPARENT = "#ff00ff"
-WHITE = "#f8fafc"
-GREEN = "#6ee7a8"
-YELLOW = "#d6b44a"
-RED = "#ef4444"
-BLUE = "#6fa8ff"
-GOLD = "#d4af37"
-TRACK = "#263244"
-INNER_TRACK = "#1b2435"
-TEXT_DIM = "#9ca3af"
+WHITE = "#EDF2F6"
+GREEN = "#81D7C0"
+YELLOW = "#E9BF75"
+RED = "#F18082"
+BLUE = "#96ADF7"
+GOLD = "#75879B"
+TRACK = "#2B3642"
+INNER_TRACK = "#242D38"
+TEXT_DIM = "#A2AFBD"
 
 ACTIVITY_WORKING = "working"
 ACTIVITY_READY = "ready"
@@ -99,8 +92,14 @@ _ACTIVITY_WAITING_EVENT_TYPES = {
 
 WIDGET_W_BOTH = 200
 WIDGET_W_SINGLE = 110
-WIDGET_H = 130
-CARD_RADIUS = 20
+WIDGET_H = 214
+UI_SCALE = 1.25
+
+
+def display_size(value):
+    return round(value * UI_SCALE)
+
+CARD_RADIUS = 22
 RENDER_SCALE = 4
 
 
@@ -172,7 +171,7 @@ def _setup_logging() -> Path:
         bool(getattr(console, "isatty", lambda: False)()) if console else False,
     )
     logging.info("Python=%s frozen=%s executable=%s", sys.version, getattr(sys, "frozen", False), sys.executable)
-    logging.info("CODEX_HOME=%s AUTH_JSON=%s INSTANCE_JSON=%s", CODEX_HOME, AUTH_JSON, INSTANCE_JSON)
+    logging.info("CODEX_HOME=%s INSTANCE_JSON=%s", CODEX_HOME, INSTANCE_JSON)
     return log_path
 
 
@@ -303,115 +302,8 @@ def ensure_single_instance() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Auth
+# Codex App Server adapter
 # ---------------------------------------------------------------------------
-
-def _is_jwt_expired(token: str, skew: int = 120) -> bool:
-    try:
-        parts = token.split(".")
-        if len(parts) < 2:
-            logging.debug("Access token is not JWT-shaped; skipping expiry check.")
-            return False
-        padding = 4 - len(parts[1]) % 4
-        payload = json.loads(b64decode(parts[1] + "=" * padding).decode("utf-8"))
-        exp = payload.get("exp")
-        if not exp:
-            logging.debug("Access token JWT has no exp claim; skipping expiry check.")
-            return False
-        return exp <= int(time.time()) + skew
-    except Exception:
-        logging.exception("Failed to inspect access token expiry; treating token as not expired.")
-        return False
-
-
-def _read_auth_json():
-    logging.debug("Reading auth file from %s.", AUTH_JSON)
-    if not AUTH_JSON.exists():
-        raise FileNotFoundError(f"auth.json not found at {AUTH_JSON}. Log in to Codex first.")
-    with open(AUTH_JSON, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _write_auth_json(auth: dict):
-    logging.debug("Writing refreshed auth file to %s.", AUTH_JSON)
-    with open(AUTH_JSON, "w", encoding="utf-8") as f:
-        json.dump(auth, f, indent=2)
-        f.write("\n")
-
-
-def _refresh_token(auth: dict) -> str:
-    refresh_token = auth.get("tokens", {}).get("refresh_token")
-    if not refresh_token:
-        raise RuntimeError("No refresh_token found in auth.json.")
-
-    logging.info("Refreshing expired Codex access token.")
-    body = json.dumps({
-        "client_id": CLIENT_ID,
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-    }).encode("utf-8")
-
-    req = Request(REFRESH_URL, data=body, headers={"Content-Type": "application/json"}, method="POST")
-    try:
-        with _URL_OPENER.open(req, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
-            refreshed = json.load(resp)
-    except TimeoutError:
-        logging.exception("Token refresh timed out after %s seconds.", REQUEST_TIMEOUT_SECONDS)
-        raise
-
-    auth.setdefault("tokens", {})
-    if "access_token" in refreshed:
-        auth["tokens"]["access_token"] = refreshed["access_token"]
-    if "refresh_token" in refreshed:
-        auth["tokens"]["refresh_token"] = refreshed["refresh_token"]
-    auth["last_refresh"] = datetime.utcnow().isoformat()
-    _write_auth_json(auth)
-    logging.info("Access token refreshed successfully.")
-    return auth["tokens"]["access_token"]
-
-
-def get_access_token() -> tuple[str, str | None]:
-    """Returns (access_token, account_id)."""
-    auth = _read_auth_json()
-
-    if not auth.get("tokens", {}).get("access_token"):
-        raise RuntimeError("No access_token in auth.json. Please log in to Codex.")
-
-    token = auth["tokens"]["access_token"]
-    if _is_jwt_expired(token):
-        token = _refresh_token(auth)
-
-    account_id = auth.get("tokens", {}).get("account_id")
-    logging.debug("Loaded access token; account_id_present=%s.", bool(account_id))
-    return token, account_id
-
-
-# ---------------------------------------------------------------------------
-# Codex API
-# ---------------------------------------------------------------------------
-
-def _normalize_window(window: dict | None) -> dict | None:
-    if not window:
-        return None
-
-    used = float(window.get("used_percent", window.get("usedPercent", 0)))
-    used = max(0.0, min(100.0, used))
-    reset_at = window.get("reset_at", window.get("resetAt"))
-    reset_after = window.get("reset_after_seconds", window.get("resetAfterSeconds"))
-    window_secs = window.get("limit_window_seconds", window.get("limitWindowSeconds", 0))
-    window_mins = window.get("window_minutes") or (
-        int(window_secs / 60) if window_secs else None
-    )
-
-    return {
-        "used_percent": used,
-        "remaining_percent": max(0.0, 100.0 - used),
-        "window_minutes": window_mins,
-        "limit_window_seconds": window_secs,
-        "reset_at": reset_at,
-        "reset_after_seconds": reset_after,
-    }
-
 
 def _format_reset(epoch_seconds, include_date: bool) -> str:
     if not epoch_seconds:
@@ -426,65 +318,33 @@ def _format_reset(epoch_seconds, include_date: bool) -> str:
 
 
 def fetch_usage() -> dict:
-    logging.info("Fetching Codex usage from %s.", BACKEND_URL)
-    token, account_id = get_access_token()
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "User-Agent": "codex-widget/1.0",
-    }
-    if account_id:
-        headers["ChatGPT-Account-Id"] = account_id
-
-    req = Request(BACKEND_URL, headers=headers)
-    try:
-        with _URL_OPENER.open(req, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
-            logging.debug("Usage response status=%s.", getattr(resp, "status", "<unknown>"))
-            payload = json.load(resp)
-    except TimeoutError:
-        logging.exception("Usage request timed out after %s seconds.", REQUEST_TIMEOUT_SECONDS)
-        raise
-
-    rl = payload.get("rate_limit") or payload.get("rateLimits") or {}
-    raw_primary = _normalize_window(rl.get("primary_window") or rl.get("primary"))
-    raw_secondary = _normalize_window(rl.get("secondary_window") or rl.get("secondary"))
-
-    # Detect weekly-only mode: primary window is 7 days (604800s) and no secondary.
-    # On Pro, primary is the 5h window (~18000s) and secondary is the weekly window.
-    WEEKLY_SECONDS = 604800
-    if (
-        raw_primary is not None
-        and raw_secondary is None
-        and raw_primary.get("limit_window_seconds", 0) >= WEEKLY_SECONDS
-    ):
-        primary = None
-        secondary = raw_primary
-    else:
-        primary = raw_primary
-        secondary = raw_secondary
-
-    status = payload.get("rate_limit_reached_type")
-    if isinstance(status, dict):
-        status = status.get("kind", "OK")
-    status = status or "OK"
-    if status.lower() == "unknown":
-        status = "OK"
-
+    """Local deployment adapter using the installed Codex App Server."""
+    from codex_usage import query_usage
+    snapshot = query_usage(timeout=20)
+    def window(value):
+        if value is None:
+            return None
+        seconds = (value.duration_minutes or 0) * 60
+        return {
+            "used_percent": value.used_percent,
+            "remaining_percent": value.remaining_percent,
+            "window_minutes": value.duration_minutes,
+            "limit_window_seconds": seconds,
+            "reset_at": value.resets_at,
+            "reset_after_seconds": max(0, (value.resets_at or int(time.time())) - int(time.time())),
+        }
+    primary, secondary = window(snapshot.primary), window(snapshot.secondary)
     result = {
-        "plan": payload.get("plan_type") or payload.get("planType") or "unknown",
-        "limit_status": status,
+        "plan": snapshot.plan,
+        "limit_status": snapshot.reached_type or "OK",
         "primary": primary,
         "secondary": secondary,
+        "monthly": snapshot.monthly,
         "primary_reset_time": _format_reset(primary["reset_at"] if primary else None, True),
         "secondary_reset_time": _format_reset(secondary["reset_at"] if secondary else None, True),
         "fetched_at": datetime.now().strftime("%H:%M:%S"),
     }
-    logging.info(
-        "Usage fetched: plan=%s status=%s primary=%s secondary=%s.",
-        result["plan"],
-        result["limit_status"],
-        primary,
-        secondary,
-    )
+    logging.info("Usage fetched through Codex App Server successfully.")
     return result
 
 
@@ -642,7 +502,7 @@ def _primary_monitor_rect(root: tk.Tk) -> tuple[int, int, int, int]:
 
 
 def _position_on_available_screen(root: tk.Tk, x: int, y: int, widget_w: int) -> tuple[int, int, bool]:
-    widget_rect = (x, y, x + widget_w, y + WIDGET_H)
+    widget_rect = (x, y, x + widget_w, y + display_size(WIDGET_H))
     monitors = _get_monitor_rects()
     if monitors and any(_rect_intersects(widget_rect, monitor) for monitor in monitors):
         logging.debug("Saved widget position is visible: x=%s y=%s.", x, y)
@@ -894,6 +754,7 @@ class CodexOverlay:
         self.weekly_time_left = None
         self.primary_reset = "--/-- --:--"
         self.weekly_reset = "--/-- --:--"
+        self.monthly = None
         self.error = False
         self.activity_status = ACTIVITY_CLOSED
         self.activity_scanner = CodexActivityScanner()
@@ -915,8 +776,8 @@ class CodexOverlay:
         logging.debug("Building widget UI.")
         self.canvas = tk.Canvas(
             self.root,
-            width=self.widget_w,
-            height=WIDGET_H,
+            width=display_size(self.widget_w),
+            height=display_size(WIDGET_H),
             bg=TRANSPARENT,
             highlightthickness=0,
             bd=0,
@@ -926,28 +787,28 @@ class CodexOverlay:
         self.menu = tk.Menu(self.root, tearoff=0)
         self.menu.add_command(label=self._activity_menu_label(), state="disabled")
         self.activity_menu_index = self.menu.index("end")
-        self.menu.add_command(label="Refresh now", command=self.refresh_now)
+        self.menu.add_command(label="立即刷新", command=self.refresh_now)
         self.menu.add_command(label=self._lock_menu_label(), command=self.toggle_lock)
         self.lock_menu_index = self.menu.index("end")
         self.menu.add_checkbutton(
-            label="Always on top",
+            label="始终置顶",
             variable=self.always_on_top_var,
             command=self.toggle_always_on_top,
         )
         display_menu = tk.Menu(self.menu, tearoff=0)
         display_menu.add_radiobutton(
-            label="Only 5h", value="5h", variable=self.display_mode_var, command=self.change_display_mode
+            label="仅 5 小时", value="5h", variable=self.display_mode_var, command=self.change_display_mode
         )
         display_menu.add_radiobutton(
-            label="Only weekly", value="weekly", variable=self.display_mode_var, command=self.change_display_mode
+            label="仅每周", value="weekly", variable=self.display_mode_var, command=self.change_display_mode
         )
         display_menu.add_radiobutton(
-            label="Weekly + 5h", value="both", variable=self.display_mode_var, command=self.change_display_mode
+            label="双圆环", value="both", variable=self.display_mode_var, command=self.change_display_mode
         )
-        self.menu.add_cascade(label="Display", menu=display_menu)
+        self.menu.add_cascade(label="显示模式", menu=display_menu)
         self.menu.add_separator()
-        self.menu.add_command(label="Minimize to tray", command=self.minimize_to_tray)
-        self.menu.add_command(label="Quit", command=self.quit)
+        self.menu.add_command(label="收起到托盘", command=self.minimize_to_tray)
+        self.menu.add_command(label="退出", command=self.quit)
 
         self._bind_interactions(self.root)
         self._bind_interactions(self.canvas)
@@ -955,14 +816,14 @@ class CodexOverlay:
         logging.debug("Widget UI built.")
 
     def _lock_menu_label(self) -> str:
-        return "Unlock position" if self.locked else "Lock position"
+        return "解锁位置" if self.locked else "锁定位置"
 
     def _activity_menu_label(self) -> str:
         labels = {
-            ACTIVITY_WORKING: "Codex activity: Running",
-            ACTIVITY_READY: "Codex activity: Ready",
-            ACTIVITY_CLOSED: "Codex activity: Not detected",
-            ACTIVITY_ERROR: "Codex activity: Detection error",
+            ACTIVITY_WORKING: "Codex：运行中",
+            ACTIVITY_READY: "Codex：就绪",
+            ACTIVITY_CLOSED: "Codex：未检测到",
+            ACTIVITY_ERROR: "Codex：检测异常",
         }
         return labels[self.activity_status]
 
@@ -984,13 +845,13 @@ class CodexOverlay:
         self.root.update_idletasks()
         saved = _load_widget_state()
         if "x" in saved and "y" in saved:
-            x, y, moved = _position_on_available_screen(self.root, saved["x"], saved["y"], self.widget_w)
+            x, y, moved = _position_on_available_screen(self.root, saved["x"], saved["y"], display_size(self.widget_w))
         else:
             left, top, right, _bottom = _primary_monitor_rect(self.root)
-            x = max(left + 20, right - self.widget_w - 24)
+            x = max(left + 20, right - display_size(self.widget_w) - 24)
             y = top + 24
             moved = True
-        self.root.geometry(f"{self.widget_w}x{WIDGET_H}+{x}+{y}")
+        self.root.geometry(f"{display_size(self.widget_w)}x{display_size(WIDGET_H)}+{x}+{y}")
         logging.info("Widget positioned at x=%s y=%s moved=%s.", x, y, moved)
         if moved:
             self._save_state()
@@ -1071,8 +932,8 @@ class CodexOverlay:
             self.tray_limit_mode = "5h"
         elif new_mode == "weekly":
             self.tray_limit_mode = "weekly"
-        self.canvas.config(width=self.widget_w, height=WIDGET_H)
-        self.root.geometry(f"{self.widget_w}x{WIDGET_H}+{self.root.winfo_x()}+{self.root.winfo_y()}")
+        self.canvas.config(width=display_size(self.widget_w), height=display_size(WIDGET_H))
+        self.root.geometry(f"{display_size(self.widget_w)}x{display_size(WIDGET_H)}+{self.root.winfo_x()}+{self.root.winfo_y()}")
         logging.info("Display mode changed: %s.", new_mode)
         self._save_state()
         self._draw()
@@ -1118,16 +979,16 @@ class CodexOverlay:
     def _build_tray_menu(self):
         if self.display_mode == "both":
             items = [
-                pystray.MenuItem("Toggle 5h / Weekly", self._tray_click, default=True),
-                pystray.MenuItem("Maximize", self._tray_maximize),
+                pystray.MenuItem("切换 5 小时 / 每周", self._tray_click, default=True),
+                pystray.MenuItem("显示悬浮窗", self._tray_maximize),
             ]
         else:
-            items = [pystray.MenuItem("Maximize", self._tray_maximize, default=True)]
+            items = [pystray.MenuItem("显示悬浮窗", self._tray_maximize, default=True)]
         return pystray.Menu(
             *items,
-            pystray.MenuItem("Refresh now", self._tray_refresh),
+            pystray.MenuItem("立即刷新", self._tray_refresh),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Exit", self._tray_quit),
+            pystray.MenuItem("退出", self._tray_quit),
         )
 
     def _start_tray_icon(self):
@@ -1240,6 +1101,7 @@ class CodexOverlay:
         self.weekly_time_left = None
         self.primary_reset = "--/-- --:--"
         self.weekly_reset = "--/-- --:--"
+        self.monthly = None
         self._draw()
         self._update_tray_icon()
 
@@ -1249,9 +1111,10 @@ class CodexOverlay:
         secondary = data.get("secondary") or {}
         primary_left = primary.get("remaining_percent")
         weekly_left = secondary.get("remaining_percent")
+        self.monthly = data.get("monthly")
 
         # Both missing -- genuine error
-        if primary_left is None and weekly_left is None:
+        if primary_left is None and weekly_left is None and self.monthly is None:
             logging.error("Usage payload had no primary or weekly remaining percent: %s.", data)
             self._apply_error()
             return
@@ -1289,25 +1152,75 @@ class CodexOverlay:
         quota_arc_end = -90 + value * 3.6
         time_arc_end = -90 + time_value * 3.6
 
-        title_font = _font(10, bold=True)
-        percent_font = _font(23, bold=True)
-        reset_font = _font(8, bold=True)
+        title_font = ImageFont.truetype(r"C:\Windows\Fonts\msyh.ttc", 11 * s)
+        percent_font = _font(25, bold=True)
+        reset_font = _font(9)
 
         draw.text((cx * s, 16 * s), title, fill=_hex_to_rgba(TEXT_DIM), font=title_font, anchor="mm")
 
-        outer_r = 38
-        inner_r = 27
+        outer_r = 37
+        inner_r = 30
         outer = tuple(v * s for v in (cx - outer_r, cy - outer_r, cx + outer_r, cy + outer_r))
         inner = tuple(v * s for v in (cx - inner_r, cy - inner_r, cx + inner_r, cy + inner_r))
 
-        draw.arc(outer, start=0, end=359, fill=_hex_to_rgba(TRACK), width=7 * s)
-        draw.arc(outer, start=-90, end=quota_arc_end, fill=_hex_to_rgba(color), width=7 * s)
-        draw.arc(inner, start=0, end=359, fill=_hex_to_rgba(INNER_TRACK), width=4 * s)
-        draw.arc(inner, start=-90, end=time_arc_end, fill=_hex_to_rgba(GOLD), width=4 * s)
+        def arc(bounds, radius, fraction, stroke, tint):
+            draw.arc(bounds, start=0, end=360, fill=_hex_to_rgba(TRACK if radius == outer_r else INNER_TRACK), width=stroke*s)
+            if fraction <= 0:
+                return
+            end = -90 + fraction * 3.6
+            draw.arc(bounds, start=-90, end=end, fill=_hex_to_rgba(tint), width=stroke*s)
+            from math import cos, sin, radians
+            center_radius = (radius-stroke/2)*s
+            cap = stroke*s/2
+            for angle in (-90, end):
+                px, py = cx*s + center_radius*cos(radians(angle)), cy*s + center_radius*sin(radians(angle))
+                draw.ellipse((px-cap, py-cap, px+cap, py+cap), fill=_hex_to_rgba(tint))
+        arc(outer, outer_r, value, 5, color)
+        arc(inner, inner_r, time_value, 2, GOLD)
 
-        text = "--%" if percent is None else f"{value:.0f}%"
-        draw.text((cx * s, (cy + 1) * s), text, fill=_hex_to_rgba(WHITE), font=percent_font, anchor="mm")
-        draw.text((cx * s, 115 * s), f"Reset {reset_text}", fill=_hex_to_rgba(TEXT_DIM), font=reset_font, anchor="mm")
+        number = "—" if percent is None else f"{value:.0f}"
+        unit_font = _font(11)
+        number_width = draw.textlength(number, font=percent_font)
+        unit_width = draw.textlength("%", font=unit_font) if percent is not None else 0
+        x = cx*s - (number_width+unit_width+2*s)/2
+        draw.text((x, (cy+1)*s), number, fill=_hex_to_rgba(WHITE), font=percent_font, anchor="lm")
+        if percent is not None:
+            draw.text((x+number_width+2*s, (cy+5)*s), "%", fill=_hex_to_rgba(TEXT_DIM), font=unit_font, anchor="lm")
+        draw.text((cx*s, 115*s), reset_text, fill=_hex_to_rgba(TEXT_DIM), font=reset_font, anchor="mm")
+
+    def _draw_monthly(self, draw):
+        s = RENDER_SCALE
+        left, right = 18, self.widget_w - 18
+        compact = self.widget_w < WIDGET_W_BOTH
+        def font(size):
+            return ImageFont.truetype(r"C:\Windows\Fonts\msyh.ttc", size * s)
+        def text(x, y, value, fill=TEXT_DIM, anchor="lm", size=10):
+            draw.text((x*s, y*s), value, font=font(size), fill=_hex_to_rgba(fill), anchor=anchor)
+        draw.rounded_rectangle((10*s, 130*s, (self.widget_w-10)*s, 208*s), radius=12*s, fill=_hex_to_rgba("#1A2530"))
+        text(left, 144, "月度额度", size=9 if compact else 11)
+        monthly = self.monthly
+        value = monthly.remaining_percent if monthly else None
+        color = "#81D7C0" if value is None or value > 30 else _limit_color(value)
+        text(right, 144, "—" if value is None else f"{value:.0f}%", color, "rm", size=9 if compact else 11)
+        bounds = (left*s, 159*s, right*s, 166*s)
+        draw.rounded_rectangle(bounds, radius=3*s, fill=_hex_to_rgba(TRACK))
+        if value is not None and value > 0:
+            fill_right = left*s + (right-left)*s*value/100
+            draw.rounded_rectangle((left*s, 159*s, fill_right, 166*s),
+                                   radius=min(3*s, (fill_right-left*s)/2), fill=_hex_to_rgba(color))
+        amount = "额度暂不可用" if monthly is None else f"{monthly.remaining:,.0f} / {monthly.limit:,.0f}"
+        text(left, 183, amount if compact or monthly is None else f"剩余 {amount}", WHITE, size=8 if compact else 11)
+        if monthly is None or monthly.resets_at is None:
+            reset = "重置时间未知"
+        else:
+            seconds = max(0, monthly.resets_at - int(time.time()))
+            days, seconds = divmod(seconds, 86400)
+            hours, seconds = divmod(seconds, 3600)
+            minutes = seconds // 60
+            reset = f"{days}天{hours}小时后重置" if days else f"{hours}小时{minutes}分后重置"
+            if monthly.resets_at <= time.time():
+                reset = "等待额度更新"
+        text(left, 202, reset, size=7 if compact else 10)
 
     def _draw(self):
         self.canvas.delete("all")
@@ -1315,10 +1228,15 @@ class CodexOverlay:
         s = RENDER_SCALE
         image = Image.new("RGBA", (self.widget_w * s, WIDGET_H * s), _hex_to_rgba(DARK))
         draw = ImageDraw.Draw(image)
+        # A restrained vertical surface gradient, rendered at native oversampling.
+        for y in range(WIDGET_H*s):
+            t = y / max(1, WIDGET_H*s-1)
+            rgb = tuple(round(a+(b-a)*t) for a,b in zip((25,33,44),(15,21,29)))
+            draw.line((0,y,self.widget_w*s,y), fill=rgb+(255,))
 
         dot_x = (self.widget_w - 13) * s
         dot_y = 13 * s
-        dot_r = 4 * s
+        dot_r = 2.5 * s
         dot_bounds = (dot_x - dot_r, dot_y - dot_r, dot_x + dot_r, dot_y + dot_r)
         activity_colors = {
             ACTIVITY_WORKING: YELLOW,
@@ -1350,7 +1268,7 @@ class CodexOverlay:
                 66,
                 self.primary_left,
                 self.primary_time_left,
-                "5h",
+                "5 小时",
                 self.primary_reset,
                 primary_color,
             )
@@ -1365,24 +1283,27 @@ class CodexOverlay:
                 66,
                 self.weekly_left,
                 self.weekly_time_left,
-                "Weekly",
+                "每周",
                 self.weekly_reset,
                 weekly_color,
             )
 
+        self._draw_monthly(draw)
         self._show_rendered(image)
 
     def _show_rendered(self, image: Image.Image):
-        image = image.resize((self.widget_w, WIDGET_H), Image.Resampling.LANCZOS).convert("RGB")
-        keyed = Image.new("RGB", (self.widget_w, WIDGET_H), _hex_to_rgba(TRANSPARENT)[:3])
-        mask = Image.new("L", (self.widget_w, WIDGET_H), 0)
+        width, height = display_size(self.widget_w), display_size(WIDGET_H)
+        image = image.resize((width, height), Image.Resampling.LANCZOS).convert("RGB")
+        keyed = Image.new("RGB", (width, height), _hex_to_rgba(TRANSPARENT)[:3])
+        mask = Image.new("L", (width, height), 0)
         mask_draw = ImageDraw.Draw(mask)
         mask_draw.rounded_rectangle(
-            (3, 3, self.widget_w - 3, WIDGET_H - 3),
-            radius=CARD_RADIUS,
+            (4, 4, width - 4, height - 4),
+            radius=display_size(CARD_RADIUS),
             fill=255,
         )
         keyed.paste(image, (0, 0), mask)
+        ImageDraw.Draw(keyed).rounded_rectangle((4, 4, width-4, height-4), radius=display_size(CARD_RADIUS), outline="#35414F", width=1)
         self.rendered_image = ImageTk.PhotoImage(keyed)
         self.canvas.create_image(0, 0, image=self.rendered_image, anchor="nw")
 
@@ -1419,6 +1340,8 @@ class CodexOverlay:
 
     def quit(self):
         logging.info("Quit requested.")
+        (Path(os.environ.get("LOCALAPPDATA", Path.home())) / "CodexUsageRings").mkdir(parents=True, exist_ok=True)
+        (Path(os.environ.get("LOCALAPPDATA", Path.home())) / "CodexUsageRings" / "stop.requested").touch()
         self.stop_event.set()
         with self.tray_click_lock:
             if self.tray_click_timer is not None:

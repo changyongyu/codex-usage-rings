@@ -1,354 +1,127 @@
-# Codex Usage Widget
+# Codex Usage Rings
 
-A lightweight Windows widget that shows your remaining **Codex 5-hour** and **weekly usage** on the desktop and in the Windows system tray.
+Windows 桌面悬浮用量卡片：双圆环显示 **5 小时 / 每周剩余额度**，底部进度条显示**个人月度工作空间额度**。中文界面，每 60 秒刷新，支持登录自启动及异常退出恢复。
 
-<img width="189" height="124" alt="006705-20260731-132718-tk" src="https://github.com/user-attachments/assets/ea54b76f-69a9-41f9-8ade-5213d24997db" />
+![界面预览：演示数据](assets/preview.png)
 
-The tray icon shows the currently selected remaining percentage:
+> 截图使用合成演示数据，不包含真实账号信息。本项目为社区定制版本，与 OpenAI 无隶属或背书关系。来源与许可说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
-<img width="39" height="41" alt="006706-20260731-132724-" src="https://github.com/user-attachments/assets/6eb63a03-622c-42f7-9150-a95c7367bcb3" />
+## 功能
 
-> This is an unofficial community project and is not affiliated with or endorsed by OpenAI.
+- 深色渐变圆角卡片，圆头细圆环、独立月度额度区域和较大的文字。
+- 双圆环尺寸约 250 × 268 像素，可切换为仅 5 小时或仅每周模式。
+- 外环显示剩余额度，细内环显示重置前的剩余时间比例；下方显示重置日期与时间。
+- 月度进度条显示剩余比例、余额 / 总额和重置倒计时；无数据时显示“额度暂不可用”。
+- 拖动、锁定位置、置顶、收起到托盘、手动刷新、单实例运行。
+- 使用本机 Codex 登录，不需要另外填写 API key，也不需要复制认证文件。
+- 由 Windows 任务计划程序独立启动，守护程序在组件意外退出后重试。
 
-## Features
+## 环境要求
 
-- Shows the 5-hour and weekly Codex limits
-- Shows when each limit resets
-- Three display modes: **Only 5h**, **Only weekly**, or **Weekly + 5h**
-- Always-on-top floating widget
-- System tray percentage
-- Automatic refresh every 1 minutes
-- Manual refresh
-- Live Codex activity indicator
-- Lockable widget position
-- Remembers its position and settings
-- Prevents multiple copies from running simultaneously
+- Windows 10 / 11。
+- Python 3.11+，包含 Tkinter 与同目录下的 `pythonw.exe`。
+- 已安装 Codex CLI 或 Codex 桌面客户端，且已通过 ChatGPT 账号登录。
+- 网络可用。中文绘图使用 Windows 微软雅黑字体。
 
-## Before you start
+月度额度需要账号接口返回 `individualLimit`。没有设置个人月度上限的账号可能不显示该项。
 
-The widget reads the Codex login already stored on your Windows computer:
+## 安装
 
-```text
-C:\Users\<your-windows-username>\.codex\auth.json
-```
-
-You must already be signed in to Codex.
-
-The repository does **not** include your authentication file or credentials.
-
-# Installation
-
-There are three ways to use the widget.
-
-## Option 1 — Use the pre-built EXE
-
-A pre-built Windows executable is included in the repository:
-
-```text
-CodexWeeklyWidget.exe
-```
-
-1. Download the EXE.
-2. Place it in a permanent folder, for example:
-
-```text
-C:\Tools\CodexUsageWidget\
-```
-
-3. Double-click it.
-
-Python is not required for this option.
-
-Windows SmartScreen may display a warning because the EXE is not digitally signed. Review the repository before choosing **More info > Run anyway**.
-
-## Option 2 — Run from source
-
-Requirements:
-
-- Windows 10 or Windows 11
-- Python 3.11 or newer
-- Git
-
-Clone the repository:
+在 PowerShell 中克隆到准备长期保留的目录：
 
 ```powershell
-git clone https://github.com/maximevaulch/codex-usage-widget.git
-cd codex-usage-widget
+git clone https://github.com/changyongyu/codex-usage-rings.git
+cd codex-usage-rings
+python -m venv .venv
+.\install.ps1 -PythonPath '.\.venv\Scripts\python.exe'
 ```
 
-Create a virtual environment:
+脚本会安装运行依赖、注册当前用户的 `CodexUsageRings` 登录启动任务、创建桌面 **Codex Usage Rings** 快捷方式并启动组件。普通用户权限运行；如设备策略限制任务注册，请按组织策略处理。
+
+如果系统阻止运行 `.ps1`，可检查脚本后，仅对本次执行使用：
 
 ```powershell
-py -3.11 -m venv .venv
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -PythonPath '.\.venv\Scripts\python.exe'
 ```
 
-Activate it:
+`-SkipDependencies` 跳过依赖安装，`-NoStart` 只配置、不立即启动。安装脚本会拒绝覆盖另一目录的同名部署，也会拒绝更新仍在运行的组件。**不要在安装完成后移动源码或虚拟环境目录。**
 
-```powershell
-.venv\Scripts\activate
-```
+## 使用
 
-Install the dependencies:
+| 操作 | 效果 |
+| --- | --- |
+| 左键拖动 | 移动；锁定时先右键解锁 |
+| 右键 | 刷新、锁定、置顶、显示模式或退出 |
+| 双击卡片 | 收起到托盘 |
+| 双击托盘图标 | 恢复窗口 |
+| 单击托盘图标 | 双圆环模式下切换托盘显示的 5 小时 / 每周百分比 |
+| 右键“退出” | 正常结束组件和本次守护，不会立即重新弹出 |
 
-```powershell
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-```
+主动退出后，双击桌面快捷方式可再次打开，下次登录仍会自启动。
 
-Start the widget:
+### 读懂额度
 
-```powershell
-python codex_usage_widget.py
-```
+- **5 小时 / 每周**：显示账号相应窗口的剩余百分比，不是当前聊天的 token 使用量。
+- **月度额度**：工作空间所有者给当前用户设置的个人月度额度，不等于整个工作空间共享余额。
+- **颜色**：5 小时额度充足时为薄荷绿，每周额度充足时为淡紫蓝；剩余 10%～30% 为琥珀色，低于 10% 为柔红色。
+- **重置时间**：圆环下方使用本机时区，格式“日/月 时:分”；月度使用倒计时。
+- **状态点**：薄荷绿为就绪、琥珀色为运行中、空心为未检测到 Codex、柔红色为检测异常。状态由本地事件推断，可能有延迟。
 
-## Option 3 — Build your own EXE
+用量每 60 秒查询，显示也可能受服务端更新延迟影响。缺失数据与真实的 0% 会分别处理。
 
-You can build the executable in either of two ways.
+## 个性化
 
-### Method A — One-command build
+编辑 `codex_usage_widget.py` 后重新启动组件：
 
-The included `build.py` handles the complete build process automatically.
+| 设置 | 默认值 | 作用 |
+| --- | --- | --- |
+| `UI_SCALE` | `1.25` | 整体缩放，字体随面板一起放大 |
+| `POLL_SECONDS` | `60` | 查询间隔（秒） |
+| `WIDGET_W_BOTH` / `WIDGET_H` | `200` / `214` | 缩放前设计尺寸 |
+| `RENDER_SCALE` | `4` | 绘图抗锯齿采样倍率，不是界面缩放 |
 
-From the repository folder, run:
-
-```powershell
-python build.py
-```
-
-The script automatically:
-
-1. Creates `.venv` if it does not already exist
-2. Installs or updates the packages from `requirements.txt`
-3. Runs PyInstaller inside the virtual environment
-4. Builds the standalone EXE
-
-The finished file is moved to the repository root:
+## 工作方式
 
 ```text
-CodexWeeklyWidget.exe
+桌面快捷方式 → start_widget.py → Windows 任务 CodexUsageRings
+Windows 登录 ───────────────────→ Windows 任务 CodexUsageRings
+任务 → launch_supervised.py → codex_usage_widget.py → codex_usage.py → Codex App Server
 ```
 
-The temporary `dist`, `build`, and `CodexWeeklyWidget.spec` artifacts are removed after a successful build.
+正常数据路径使用 `account/rateLimits/read`，认证交给已安装的 Codex 管理。月度余额使用十进制上限减已用值计算，不写死额度或重置日期。已移除上游直接读取或更新认证文件的旧代码。
 
-You do **not** need to activate the virtual environment or install PyInstaller manually when using this method.
+## 更新与卸载
 
-### Method B — Manual PyInstaller build
-
-To control the process yourself, create and activate a virtual environment:
-
-```powershell
-py -3.11 -m venv .venv
-.venv\Scripts\activate
-```
-
-Install the dependencies, including PyInstaller:
-
-```powershell
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-Run PyInstaller manually:
-
-```powershell
-pyinstaller `
-  --noconfirm `
-  --clean `
-  --onefile `
-  --windowed `
-  --name CodexWeeklyWidget `
-  --icon codex.ico `
-  --hidden-import pystray._win32 `
-  codex_usage_widget.py
-```
-
-The finished file is created here:
-
-```text
-dist\CodexWeeklyWidget.exe
-```
-
-> The command above uses PowerShell backticks for line continuation. You can also enter it on one line.
-
-# Controls
-
-## On the floating widget
-
-| Action | Result |
-|---|---|
-| Left-click and drag | Move the widget |
-| Double-click | Minimize to the system tray |
-| Right-click | Open the widget menu |
-
-The top-right activity indicator shows:
-
-- **Yellow dot:** at least one Codex task appears to be running
-- **Green dot:** Codex is open and ready for another prompt
-- **Gray outline:** Codex is closed or could not be detected
-- **Red dot:** activity detection failed
-
-Activity is inferred every two seconds from running `Codex.exe`/`ChatGPT.exe` processes and recent local Codex session events. It is a best-effort signal; a long task that writes no transcript event for more than 30 seconds can briefly appear ready.
-
-## Right-click menu
-
-### Refresh now
-
-Immediately fetches the latest usage values.
-
-### Lock position
-
-Prevents the widget from being moved accidentally.
-
-### Always on top
-
-Keeps the widget above other application windows.
-
-### Display
-
-Choose one of the following modes:
-
-#### Only 5h
-
-- Shows only the 5-hour meter
-- Tray icon always shows the 5-hour percentage
-- Tray clicking does not toggle to weekly
-
-#### Only weekly
-
-- Shows only the weekly meter
-- Tray icon always shows the weekly percentage
-- Tray clicking does not toggle to 5-hour
-
-#### Weekly + 5h
-
-- Shows both meters
-- A single click on the tray icon switches between 5-hour and weekly
-- A double-click on the tray icon restores the widget
-
-### Minimize to tray
-
-Hides the floating widget while leaving the tray icon running.
-
-### Quit
-
-Closes the application completely.
-
-# Understanding the widget
-
-Each meter contains two rings:
-
-- **Outer ring:** percentage of usage remaining
-- **Inner gold ring:** proportion of time remaining before the reset
-
-Colors:
-
-- **Green:** more than 30% remaining
-- **Yellow:** 10% to 30% remaining
-- **Red:** less than 10% remaining
-- **Blue:** loading or unavailable
-
-# Start automatically with Windows
-
-Press:
-
-```text
-Win + R
-```
-
-Enter:
-
-```text
-shell:startup
-```
-
-Create a shortcut in that folder pointing to:
-
-```text
-CodexWeeklyWidget.exe
-```
-
-The widget will then start after you sign in to Windows.
-
-# Troubleshooting
-
-## The widget shows `ERR`
-
-Check the log file:
-
-```text
-C:\Users\<your-windows-username>\.codex\codex_widget.log
-```
-
-Common causes include:
-
-- Codex is not signed in
-- `auth.json` is missing
-- The authentication session expired
-- The computer is offline
-- A firewall blocked the request
-- The request timed out
-
-After fixing the issue, right-click the widget and select **Refresh now**.
-
-## The widget does not appear
-
-Check the hidden tray icons near the Windows clock. The widget may already be minimized.
-
-Also check Task Manager. Only one instance can run at a time.
-
-## The widget is off-screen
-
-Close the widget and delete:
-
-```text
-C:\Users\<your-windows-username>\.codex\widget_pos.json
-```
-
-Restart the widget. It will return to its default position.
-
-# Local files
-
-The widget stores its local data in:
-
-```text
-C:\Users\<your-windows-username>\.codex\
-```
-
-| File | Purpose |
-|---|---|
-| `auth.json` | Codex authentication; never share or commit it |
-| `widget_pos.json` | Position and display settings |
-| `codex_widget.log` | Diagnostic log |
-| `codex_widget_instance.json` | Current process metadata |
-
-# Updating
-
-For a cloned repository:
+更新前先右键退出组件，随后：
 
 ```powershell
 git pull
+.\install.ps1 -PythonPath '.\.venv\Scripts\python.exe'
 ```
 
-Run the source version:
+卸载任务和桌面快捷方式：
 
 ```powershell
-.venv\Scripts\activate
-pip install -r requirements.txt
-python codex_usage_widget.py
+.\uninstall.ps1
 ```
 
-Or rebuild the EXE in one command:
+卸载保留源码、设置和日志，不删除 Codex 登录或会话数据。详细故障排查见 [OPERATIONS.md](OPERATIONS.md)。
+
+## 开发与验证
 
 ```powershell
-python build.py
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe scripts\render_preview.py
 ```
 
-# Security
+预览脚本使用演示数据，不查询账号。本地测试覆盖月度额度解析，安装脚本可通过 PowerShell 语法检查；这些检查不代替真实桌面、多显示器或任务注册的实机验证。当前发布不包含 GitHub Actions 工作流。
 
-Never upload or commit:
+## 来源与许可
 
-```text
-C:\Users\<your-windows-username>\.codex\auth.json
-```
+双圆环和托盘界面基于 [maximevaulch/codex-usage-widget](https://github.com/maximevaulch/codex-usage-widget)；App Server 读取模块基于 [Wannatep/codex-usage-mini-widget](https://github.com/Wannatep/codex-usage-mini-widget)。
 
-The application reads authentication from the current Windows user's Codex folder and does not include personal credentials in the source code.
+上游双圆环项目未提供开源许可证，本项目保留 GitHub fork 来源关系，**不将全部代码重新声明为 MIT 或其他开源许可**。读取模块的原始 Unlicense 文本保存在 [licenses](licenses/codex-usage-mini-widget-UNLICENSE.txt)。各部分权利说明详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+## 隐私
+
+不要上传 Codex 认证文件、日志、个人设置或真实额度截图。项目 `.gitignore` 已排除常见状态文件；公开前仍应检查提交内容。组件日志包含额度与本地诊断信息，分享前请检查。

@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+*.log
+*.log.*
+auth.json
+widget_pos*.json
+codex_widget_instance.json
+child.pid
+stop.requested
+*.before-*.py
+preview*.png
+!assets/preview.png
+build/
+dist/
+*.spec
+*.exe
+*.zip
+
+# Local CI draft requires additional GitHub OAuth workflow scope.
+.github/workflows/checks.yml
