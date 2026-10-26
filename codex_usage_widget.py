@@ -2,7 +2,7 @@
 Codex Usage Widget
 ------------------
 Always-on-top desktop card for Codex 5h, weekly, and monthly allowances.
-Default double-meter display: 250x268 px; launched via Windows Task Scheduler.
+Two switchable styles; launched independently via Windows Task Scheduler.
 
 Python 3.11+ on Windows.
 """
@@ -20,6 +20,8 @@ from datetime import datetime
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont, ImageTk
+from widget_styles import (DEFAULT_STYLE, STYLE_NAMES, WIDTH_BOTH, WIDTH_SINGLE,
+                           HEIGHT, normalize_style, render_card)
 
 try:
     import pystray
@@ -48,16 +50,6 @@ _OWNS_MUTEX = False
 
 DARK = "#111820"
 TRANSPARENT = "#ff00ff"
-WHITE = "#EDF2F6"
-GREEN = "#81D7C0"
-YELLOW = "#E9BF75"
-RED = "#F18082"
-BLUE = "#96ADF7"
-GOLD = "#75879B"
-TRACK = "#2B3642"
-INNER_TRACK = "#242D38"
-TEXT_DIM = "#A2AFBD"
-
 ACTIVITY_WORKING = "working"
 ACTIVITY_READY = "ready"
 ACTIVITY_CLOSED = "closed"
@@ -90,18 +82,14 @@ _ACTIVITY_WAITING_EVENT_TYPES = {
     "user_input_requested",
 }
 
-WIDGET_W_BOTH = 200
-WIDGET_W_SINGLE = 110
-WIDGET_H = 214
+WIDGET_W_BOTH = WIDTH_BOTH
+WIDGET_W_SINGLE = WIDTH_SINGLE
+WIDGET_H = HEIGHT
 UI_SCALE = 1.25
 
 
 def display_size(value):
     return round(value * UI_SCALE)
-
-CARD_RADIUS = 22
-RENDER_SCALE = 4
-
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -352,45 +340,6 @@ def fetch_usage() -> dict:
 # Overlay UI
 # ---------------------------------------------------------------------------
 
-def _limit_color(percent_left: float) -> str:
-    if percent_left < 10:
-        return RED
-    if percent_left <= 30:
-        return YELLOW
-    return GREEN
-
-
-def _hex_to_rgba(color: str, alpha: int = 255) -> tuple[int, int, int, int]:
-    color = color.lstrip("#")
-    return int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16), alpha
-
-
-def _font(size: int, bold: bool = False, symbol: bool = False) -> ImageFont.ImageFont:
-    names = []
-    if symbol:
-        names.append(r"C:\Windows\Fonts\seguisym.ttf")
-    names.append(r"C:\Windows\Fonts\segoeuib.ttf" if bold else r"C:\Windows\Fonts\segoeui.ttf")
-    names.append("arialbd.ttf" if bold else "arial.ttf")
-
-    for name in names:
-        try:
-            return ImageFont.truetype(name, size * RENDER_SCALE)
-        except OSError:
-            continue
-    return ImageFont.load_default()
-
-
-def _reset_remaining_percent(window: dict) -> float | None:
-    try:
-        reset_after = float(window["reset_after_seconds"])
-        window_seconds = float(window["limit_window_seconds"])
-        if window_seconds <= 0:
-            return None
-        return max(0.0, min(100.0, (reset_after / window_seconds) * 100.0))
-    except Exception:
-        return None
-
-
 def _load_widget_state() -> dict:
     try:
         if not WIDGET_POS_JSON.exists():
@@ -404,6 +353,7 @@ def _load_widget_state() -> dict:
             "locked": bool(payload.get("locked", False)),
             "always_on_top": bool(payload.get("always_on_top", True)),
             "display_mode": payload.get("display_mode", "both"),
+            "style": normalize_style(payload.get("style")),
         }
         logging.debug("Loaded widget state: %s.", state)
         return state
@@ -412,10 +362,12 @@ def _load_widget_state() -> dict:
         return {}
 
 
-def _save_widget_state(x: int, y: int, locked: bool, always_on_top: bool, display_mode: str):
+def _save_widget_state(x: int, y: int, locked: bool, always_on_top: bool, display_mode: str,
+                       style: str = DEFAULT_STYLE):
     try:
         CODEX_HOME.mkdir(parents=True, exist_ok=True)
-        with open(WIDGET_POS_JSON, "w", encoding="utf-8") as f:
+        temporary = WIDGET_POS_JSON.with_suffix(".tmp")
+        with open(temporary, "w", encoding="utf-8") as f:
             json.dump(
                 {
                     "x": x,
@@ -423,10 +375,12 @@ def _save_widget_state(x: int, y: int, locked: bool, always_on_top: bool, displa
                     "locked": locked,
                     "always_on_top": always_on_top,
                     "display_mode": display_mode,
+                    "style": normalize_style(style),
                 },
                 f,
             )
             f.write("\n")
+        temporary.replace(WIDGET_POS_JSON)
         logging.debug(
             "Saved widget state: x=%s y=%s locked=%s always_on_top=%s display_mode=%s.",
             x,
@@ -502,24 +456,26 @@ def _primary_monitor_rect(root: tk.Tk) -> tuple[int, int, int, int]:
 
 
 def _position_on_available_screen(root: tk.Tk, x: int, y: int, widget_w: int) -> tuple[int, int, bool]:
-    widget_rect = (x, y, x + widget_w, y + display_size(WIDGET_H))
-    monitors = _get_monitor_rects()
-    if monitors and any(_rect_intersects(widget_rect, monitor) for monitor in monitors):
-        logging.debug("Saved widget position is visible: x=%s y=%s.", x, y)
-        return x, y, False
+    widget_h = display_size(WIDGET_H)
+    monitors = _get_monitor_rects() or [(0, 0, root.winfo_screenwidth(), root.winfo_screenheight())]
 
-    if not monitors:
-        screen_width = root.winfo_screenwidth()
-        screen_height = root.winfo_screenheight()
-        if 0 <= x < screen_width - 24 and 0 <= y < screen_height - 24:
-            logging.debug("Saved widget position is visible using Tk screen bounds: x=%s y=%s.", x, y)
-            return x, y, False
+    def overlap(rect):
+        left, top, right, bottom = rect
+        return max(0, min(x+widget_w, right)-max(x, left)) * max(0, min(y+widget_h, bottom)-max(y, top))
 
-    left, top, right, _bottom = _primary_monitor_rect(root)
-    new_x = max(left + 20, right - widget_w - 24)
-    new_y = top + 24
-    logging.info("Saved widget position is off-screen; moving from (%s, %s) to (%s, %s).", x, y, new_x, new_y)
-    return new_x, new_y, True
+    monitor = max(monitors, key=overlap)
+    if overlap(monitor):
+        left, top, right, bottom = monitor
+        new_x = max(left, min(x, right-widget_w))
+        new_y = max(top, min(y, bottom-widget_h))
+    else:
+        left, top, right, bottom = _primary_monitor_rect(root)
+        new_x = max(left, right-widget_w-24)
+        new_y = max(top, min(top+24, bottom-widget_h))
+    moved = (x, y) != (new_x, new_y)
+    if moved:
+        logging.info("Fitting widget to screen: (%s, %s) -> (%s, %s).", x, y, new_x, new_y)
+    return new_x, new_y, moved
 
 
 # ---------------------------------------------------------------------------
@@ -742,18 +698,21 @@ class CodexOverlay:
         self.poll_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.locked = bool(self.state.get("locked", False))
-        self.always_on_top_var = tk.BooleanVar(value=self.always_on_top)
+        self.always_on_top_var = tk.BooleanVar(master=self.root, value=self.always_on_top)
         self.display_mode = self.state.get("display_mode", "both")
         if self.display_mode not in {"5h", "weekly", "both"}:
             self.display_mode = "both"
-        self.display_mode_var = tk.StringVar(value=self.display_mode)
+        self.display_mode_var = tk.StringVar(master=self.root, value=self.display_mode)
+        self.style = normalize_style(self.state.get("style"))
+        self.style_var = tk.StringVar(master=self.root, value=self.style)
         self.widget_w = WIDGET_W_BOTH if self.display_mode == "both" else WIDGET_W_SINGLE
         self.primary_left = None
         self.weekly_left = None
-        self.primary_time_left = None
-        self.weekly_time_left = None
         self.primary_reset = "--/-- --:--"
         self.weekly_reset = "--/-- --:--"
+        self.primary_reset_at = None
+        self.weekly_reset_at = None
+        self.updated_at = None
         self.monthly = None
         self.error = False
         self.activity_status = ACTIVITY_CLOSED
@@ -770,6 +729,7 @@ class CodexOverlay:
         self.root.deiconify()
         self._start_activity_monitor()
         self._start_polling()
+        self.root.after(30000, self._tick_clock)
         logging.info("CodexOverlay initialized.")
 
     def _build_ui(self):
@@ -806,6 +766,11 @@ class CodexOverlay:
             label="双圆环", value="both", variable=self.display_mode_var, command=self.change_display_mode
         )
         self.menu.add_cascade(label="显示模式", menu=display_menu)
+        style_menu = tk.Menu(self.menu, tearoff=0)
+        for key, label in STYLE_NAMES.items():
+            style_menu.add_radiobutton(label=label, value=key, variable=self.style_var,
+                                       command=self.change_style)
+        self.menu.add_cascade(label="展示风格", menu=style_menu)
         self.menu.add_separator()
         self.menu.add_command(label="收起到托盘", command=self.minimize_to_tray)
         self.menu.add_command(label="退出", command=self.quit)
@@ -854,7 +819,8 @@ class CodexOverlay:
         self.root.geometry(f"{display_size(self.widget_w)}x{display_size(WIDGET_H)}+{x}+{y}")
         logging.info("Widget positioned at x=%s y=%s moved=%s.", x, y, moved)
         if moved:
-            self._save_state()
+            # A withdrawn Tk window may still report (0, 0) until it is mapped.
+            _save_widget_state(x, y, self.locked, self.always_on_top, self.display_mode, self.style)
 
     def _drag_start(self, event):
         if self.locked:
@@ -919,8 +885,25 @@ class CodexOverlay:
             self.locked,
             self.always_on_top,
             self.display_mode,
+            self.style,
         )
 
+
+    def change_style(self, style=None):
+        self.style = normalize_style(self.style_var.get() if style is None else style)
+        self.style_var.set(self.style)
+        self._save_state()
+        self._draw()
+        if self.tray_icon is not None:
+            self.tray_icon.menu = self._build_tray_menu()
+            self.tray_icon.update_menu()
+        logging.info("Widget style changed: %s.", self.style)
+
+    def _tick_clock(self):
+        if not self.stop_event.is_set():
+            if self.widget_visible:
+                self._draw()
+            self.root.after(30000, self._tick_clock)
 
     def change_display_mode(self):
         new_mode = self.display_mode_var.get()
@@ -933,9 +916,10 @@ class CodexOverlay:
         elif new_mode == "weekly":
             self.tray_limit_mode = "weekly"
         self.canvas.config(width=display_size(self.widget_w), height=display_size(WIDGET_H))
-        self.root.geometry(f"{display_size(self.widget_w)}x{display_size(WIDGET_H)}+{self.root.winfo_x()}+{self.root.winfo_y()}")
+        x, y, _ = _position_on_available_screen(self.root, self.root.winfo_x(), self.root.winfo_y(), display_size(self.widget_w))
+        self.root.geometry(f"{display_size(self.widget_w)}x{display_size(WIDGET_H)}+{x}+{y}")
         logging.info("Display mode changed: %s.", new_mode)
-        self._save_state()
+        _save_widget_state(x, y, self.locked, self.always_on_top, self.display_mode, self.style)
         self._draw()
         if self.tray_icon is not None:
             self.tray_icon.menu = self._build_tray_menu()
@@ -987,9 +971,22 @@ class CodexOverlay:
         return pystray.Menu(
             *items,
             pystray.MenuItem("立即刷新", self._tray_refresh),
+            pystray.MenuItem("展示风格", pystray.Menu(*[
+                pystray.MenuItem(label, self._tray_style_action(key), radio=True,
+                                 checked=self._tray_style_checked(key))
+                for key, label in STYLE_NAMES.items()
+            ])),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("退出", self._tray_quit),
         )
+
+    def _tray_style_action(self, key):
+        def action(_icon, _item):
+            self.root.after(0, lambda: self.change_style(key))
+        return action
+
+    def _tray_style_checked(self, key):
+        return lambda _item: self.style == key
 
     def _start_tray_icon(self):
         logging.info("Starting system tray icon.")
@@ -1087,6 +1084,7 @@ class CodexOverlay:
     def maximize_from_tray(self):
         logging.info("Restoring widget from tray.")
         self.widget_visible = True
+        self._draw()
         self.root.deiconify()
         self.root.lift()
         if self.always_on_top:
@@ -1097,11 +1095,12 @@ class CodexOverlay:
         self.error = False
         self.primary_left = None
         self.weekly_left = None
-        self.primary_time_left = None
-        self.weekly_time_left = None
         self.primary_reset = "--/-- --:--"
         self.weekly_reset = "--/-- --:--"
         self.monthly = None
+        self.primary_reset_at = None
+        self.weekly_reset_at = None
+        self.updated_at = None
         self._draw()
         self._update_tray_icon()
 
@@ -1122,8 +1121,9 @@ class CodexOverlay:
         self.error = False
         self.primary_left = primary_left
         self.weekly_left = weekly_left
-        self.primary_time_left = _reset_remaining_percent(primary) if primary else None
-        self.weekly_time_left = _reset_remaining_percent(secondary) if secondary else None
+        self.primary_reset_at = primary.get("reset_at")
+        self.weekly_reset_at = secondary.get("reset_at")
+        self.updated_at = time.time()
         self.primary_reset = data.get("primary_reset_time", "--/-- --:--")
         self.weekly_reset = data.get("secondary_reset_time", "--/-- --:--")
         self._draw()
@@ -1135,176 +1135,25 @@ class CodexOverlay:
         self._draw()
         self._update_tray_icon()
 
-    def _draw_meter_image(
-        self,
-        draw: ImageDraw.ImageDraw,
-        cx: int,
-        cy: int,
-        percent: float | None,
-        time_percent: float | None,
-        title: str,
-        reset_text: str,
-        color: str,
-    ):
-        s = RENDER_SCALE
-        value = 0.0 if percent is None else max(0.0, min(100.0, float(percent)))
-        time_value = 0.0 if time_percent is None else max(0.0, min(100.0, float(time_percent)))
-        quota_arc_end = -90 + value * 3.6
-        time_arc_end = -90 + time_value * 3.6
-
-        title_font = ImageFont.truetype(r"C:\Windows\Fonts\msyh.ttc", 11 * s)
-        percent_font = _font(25, bold=True)
-        reset_font = _font(9)
-
-        draw.text((cx * s, 16 * s), title, fill=_hex_to_rgba(TEXT_DIM), font=title_font, anchor="mm")
-
-        outer_r = 37
-        inner_r = 30
-        outer = tuple(v * s for v in (cx - outer_r, cy - outer_r, cx + outer_r, cy + outer_r))
-        inner = tuple(v * s for v in (cx - inner_r, cy - inner_r, cx + inner_r, cy + inner_r))
-
-        def arc(bounds, radius, fraction, stroke, tint):
-            draw.arc(bounds, start=0, end=360, fill=_hex_to_rgba(TRACK if radius == outer_r else INNER_TRACK), width=stroke*s)
-            if fraction <= 0:
-                return
-            end = -90 + fraction * 3.6
-            draw.arc(bounds, start=-90, end=end, fill=_hex_to_rgba(tint), width=stroke*s)
-            from math import cos, sin, radians
-            center_radius = (radius-stroke/2)*s
-            cap = stroke*s/2
-            for angle in (-90, end):
-                px, py = cx*s + center_radius*cos(radians(angle)), cy*s + center_radius*sin(radians(angle))
-                draw.ellipse((px-cap, py-cap, px+cap, py+cap), fill=_hex_to_rgba(tint))
-        arc(outer, outer_r, value, 5, color)
-        arc(inner, inner_r, time_value, 2, GOLD)
-
-        number = "—" if percent is None else f"{value:.0f}"
-        unit_font = _font(11)
-        number_width = draw.textlength(number, font=percent_font)
-        unit_width = draw.textlength("%", font=unit_font) if percent is not None else 0
-        x = cx*s - (number_width+unit_width+2*s)/2
-        draw.text((x, (cy+1)*s), number, fill=_hex_to_rgba(WHITE), font=percent_font, anchor="lm")
-        if percent is not None:
-            draw.text((x+number_width+2*s, (cy+5)*s), "%", fill=_hex_to_rgba(TEXT_DIM), font=unit_font, anchor="lm")
-        draw.text((cx*s, 115*s), reset_text, fill=_hex_to_rgba(TEXT_DIM), font=reset_font, anchor="mm")
-
-    def _draw_monthly(self, draw):
-        s = RENDER_SCALE
-        left, right = 18, self.widget_w - 18
-        compact = self.widget_w < WIDGET_W_BOTH
-        def font(size):
-            return ImageFont.truetype(r"C:\Windows\Fonts\msyh.ttc", size * s)
-        def text(x, y, value, fill=TEXT_DIM, anchor="lm", size=10):
-            draw.text((x*s, y*s), value, font=font(size), fill=_hex_to_rgba(fill), anchor=anchor)
-        draw.rounded_rectangle((10*s, 130*s, (self.widget_w-10)*s, 208*s), radius=12*s, fill=_hex_to_rgba("#1A2530"))
-        text(left, 144, "月度额度", size=9 if compact else 11)
-        monthly = self.monthly
-        value = monthly.remaining_percent if monthly else None
-        color = "#81D7C0" if value is None or value > 30 else _limit_color(value)
-        text(right, 144, "—" if value is None else f"{value:.0f}%", color, "rm", size=9 if compact else 11)
-        bounds = (left*s, 159*s, right*s, 166*s)
-        draw.rounded_rectangle(bounds, radius=3*s, fill=_hex_to_rgba(TRACK))
-        if value is not None and value > 0:
-            fill_right = left*s + (right-left)*s*value/100
-            draw.rounded_rectangle((left*s, 159*s, fill_right, 166*s),
-                                   radius=min(3*s, (fill_right-left*s)/2), fill=_hex_to_rgba(color))
-        amount = "额度暂不可用" if monthly is None else f"{monthly.remaining:,.0f} / {monthly.limit:,.0f}"
-        text(left, 183, amount if compact or monthly is None else f"剩余 {amount}", WHITE, size=8 if compact else 11)
-        if monthly is None or monthly.resets_at is None:
-            reset = "重置时间未知"
-        else:
-            seconds = max(0, monthly.resets_at - int(time.time()))
-            days, seconds = divmod(seconds, 86400)
-            hours, seconds = divmod(seconds, 3600)
-            minutes = seconds // 60
-            reset = f"{days}天{hours}小时后重置" if days else f"{hours}小时{minutes}分后重置"
-            if monthly.resets_at <= time.time():
-                reset = "等待额度更新"
-        text(left, 202, reset, size=7 if compact else 10)
-
     def _draw(self):
         self.canvas.delete("all")
-
-        s = RENDER_SCALE
-        image = Image.new("RGBA", (self.widget_w * s, WIDGET_H * s), _hex_to_rgba(DARK))
-        draw = ImageDraw.Draw(image)
-        # A restrained vertical surface gradient, rendered at native oversampling.
-        for y in range(WIDGET_H*s):
-            t = y / max(1, WIDGET_H*s-1)
-            rgb = tuple(round(a+(b-a)*t) for a,b in zip((25,33,44),(15,21,29)))
-            draw.line((0,y,self.widget_w*s,y), fill=rgb+(255,))
-
-        dot_x = (self.widget_w - 13) * s
-        dot_y = 13 * s
-        dot_r = 2.5 * s
-        dot_bounds = (dot_x - dot_r, dot_y - dot_r, dot_x + dot_r, dot_y + dot_r)
-        activity_colors = {
-            ACTIVITY_WORKING: YELLOW,
-            ACTIVITY_READY: GREEN,
-            ACTIVITY_ERROR: RED,
-        }
-        if self.activity_status == ACTIVITY_CLOSED:
-            draw.ellipse(dot_bounds, outline=_hex_to_rgba(TEXT_DIM), width=max(1, s))
-        else:
-            draw.ellipse(dot_bounds, fill=_hex_to_rgba(activity_colors[self.activity_status]))
-
-        if self.error:
-            draw.text(
-                ((self.widget_w // 2) * s, (WIDGET_H // 2) * s),
-                "ERR",
-                fill=_hex_to_rgba(RED),
-                font=_font(24, bold=True),
-                anchor="mm",
-            )
-            self._show_rendered(image)
-            return
-
-        primary_color = BLUE if self.primary_left is None else _limit_color(self.primary_left)
-        weekly_color = BLUE if self.weekly_left is None or self.weekly_left > 30 else _limit_color(self.weekly_left)
-        if self.display_mode in {"5h", "both"}:
-            self._draw_meter_image(
-                draw,
-                55,
-                66,
-                self.primary_left,
-                self.primary_time_left,
-                "5 小时",
-                self.primary_reset,
-                primary_color,
-            )
-        if self.display_mode == "weekly":
-            weekly_cx = 55
-        else:
-            weekly_cx = 145
-        if self.display_mode in {"weekly", "both"}:
-            self._draw_meter_image(
-                draw,
-                weekly_cx,
-                66,
-                self.weekly_left,
-                self.weekly_time_left,
-                "每周",
-                self.weekly_reset,
-                weekly_color,
-            )
-
-        self._draw_monthly(draw)
+        image = render_card(
+            style=self.style, mode=self.display_mode,
+            primary=self.primary_left, weekly=self.weekly_left,
+            primary_reset=self.primary_reset_at, weekly_reset=self.weekly_reset_at,
+            monthly=self.monthly, activity=self.activity_status,
+            updated_at=self.updated_at, error=self.error,
+        )
         self._show_rendered(image)
 
     def _show_rendered(self, image: Image.Image):
-        width, height = display_size(self.widget_w), display_size(WIDGET_H)
-        image = image.resize((width, height), Image.Resampling.LANCZOS).convert("RGB")
-        keyed = Image.new("RGB", (width, height), _hex_to_rgba(TRANSPARENT)[:3])
-        mask = Image.new("L", (width, height), 0)
-        mask_draw = ImageDraw.Draw(mask)
-        mask_draw.rounded_rectangle(
-            (4, 4, width - 4, height - 4),
-            radius=display_size(CARD_RADIUS),
-            fill=255,
-        )
-        keyed.paste(image, (0, 0), mask)
-        ImageDraw.Draw(keyed).rounded_rectangle((4, 4, width-4, height-4), radius=display_size(CARD_RADIUS), outline="#35414F", width=1)
-        self.rendered_image = ImageTk.PhotoImage(keyed)
+        size = (display_size(self.widget_w), display_size(WIDGET_H))
+        image = image.resize(size, Image.Resampling.LANCZOS)
+        # Tk uses a color key on Windows; keep the rounded silhouette and hard shadow.
+        keyed = Image.new("RGB", size, TRANSPARENT)
+        mask = image.getchannel("A").point(lambda alpha: 255 if alpha >= 128 else 0)
+        keyed.paste(image.convert("RGB"), (0, 0), mask)
+        self.rendered_image = ImageTk.PhotoImage(keyed, master=self.root)
         self.canvas.create_image(0, 0, image=self.rendered_image, anchor="nw")
 
     def refresh_now(self):

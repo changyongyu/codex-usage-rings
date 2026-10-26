@@ -24,7 +24,7 @@ Start-ScheduledTask -TaskName 'CodexUsageRings'
 
 | 路径 | 内容 |
 | --- | --- |
-| `%USERPROFILE%\.codex\widget_pos.json` | 位置、锁定、置顶和显示模式 |
+| `%USERPROFILE%\.codex\widget_pos.json` | 位置、锁定、置顶、显示模式和展示风格 |
 | `%USERPROFILE%\.codex\codex_widget.log` | 查询和界面日志，含额度数据 |
 | `%USERPROFILE%\.codex\codex_widget_instance.json` | 当前组件进程信息 |
 | `%LOCALAPPDATA%\CodexUsageRings\launcher.log` | 带轮转的守护日志 |
@@ -35,6 +35,14 @@ Start-ScheduledTask -TaskName 'CodexUsageRings'
 
 不要删除整个 `.codex` 目录：它属于 Codex，也包含认证和历史信息。日志可能包含敏感的额度和路径，分享前请检查。
 
+## 展示风格与升级
+
+卡片或托盘右键 → **展示风格** → **蒙德里安 / 孟菲斯波点**。切换即时生效，自动写入设置中的 `style` 字段（`mondrian` / `memphis`），重启继续使用。
+
+没有保存风格的新安装默认使用蒙德里安；升级旧版本时，缺失或无效的风格值也回退到蒙德里安。安装和升级不覆盖已经保存的有效选择。请将 `widget_styles.py` 与 `codex_usage_widget.py` 一同更新，避免缺失绘制模块。
+
+新双环卡片默认约 365 × 495 像素。恢复位置时会检查屏幕边界；若原位置容纳不下新卡片，会移动到可见区域。字体、圆环和卡片可通过 `UI_SCALE` 一起缩放。
+
 ## 卡片消失
 
 1. 检查系统托盘，双击图标恢复窗口。
@@ -43,7 +51,7 @@ Start-ScheduledTask -TaskName 'CodexUsageRings'
 4. 检查任务状态。`Running` 仅表示任务入口运行，不等于数据读取成功，需结合窗口及查询日志判断。
 5. 如果多显示器布局改变，退出后将 `widget_pos.json` 重命名备份，再启动以恢复默认位置。
 
-## 显示 ERR / 月度不可用
+## 显示“读取失败” / 月度不可用
 
 检查 Codex 是否已登录、网络是否可用，再右键“立即刷新”或等待下一轮查询。
 

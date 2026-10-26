@@ -13,6 +13,7 @@ stop.requested
 *.before-*.py
 preview*.png
 !assets/preview.png
+!assets/preview-memphis.png
 build/
 dist/
 *.spec
