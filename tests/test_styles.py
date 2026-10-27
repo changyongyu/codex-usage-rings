@@ -9,8 +9,40 @@ import tempfile
 import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
+from PIL import ImageChops
 
-from widget_styles import DEFAULT_STYLE, normalize_style, reset_countdown, reset_date
+from widget_styles import (DEFAULT_STYLE, normalize_style, reset_countdown, reset_date,
+                           render_card, PALETTES, RENDER_SCALE, WIDTH_BOTH, HEIGHT)
+
+
+class LiquidRendererTests(unittest.TestCase):
+    def test_zero_missing_and_failed_data_are_not_conflated(self):
+        kwargs = dict(now=1000, weekly=64)
+        zero = render_card(primary=0, **kwargs)
+        missing = render_card(primary=None, **kwargs)
+        failure = render_card(primary=72, error=True, **kwargs)
+        self.assertNotEqual(zero.tobytes(), missing.tobytes())
+        self.assertEqual(failure.tobytes(), render_card(primary=None, error=True, **kwargs).tobytes())
+
+    def test_wave_only_changes_hero_and_never_mutates_cached_layers(self):
+        for style in PALETTES:
+            kwargs = dict(style=style, primary=50, weekly=64, now=1000)
+            still = render_card(**kwargs)
+            wave = render_card(**kwargs, wave_time=.16)
+            changed = ImageChops.difference(still.convert("RGB"), wave.convert("RGB")).getbbox()
+            self.assertIsNotNone(changed)
+            self.assertLessEqual(changed[2], 164*RENDER_SCALE)
+            self.assertEqual(still.tobytes(), render_card(**kwargs).tobytes())
+            self.assertEqual(still.tobytes(), render_card(**kwargs, wave_time=3).tobytes())
+
+    def test_empty_and_full_liquid_are_clamped_and_no_offset_shadow(self):
+        for style in PALETTES:
+            empty = render_card(style=style, primary=50, now=1000, liquid_percent=-5)
+            full = render_card(style=style, primary=50, now=1000, liquid_percent=105)
+            point = (120*RENDER_SCALE, 200*RENDER_SCALE)
+            self.assertNotEqual(empty.getpixel(point), full.getpixel(point))
+            self.assertEqual(full.size, (WIDTH_BOTH*RENDER_SCALE, HEIGHT*RENDER_SCALE))
+            self.assertEqual(full.getpixel((full.width-1, full.height-1))[3], 0)
 
 
 class ResetTimeTests(unittest.TestCase):
@@ -94,7 +126,8 @@ class MenuPersistenceTests(unittest.TestCase):
         root = SimpleNamespace(winfo_screenwidth=lambda: 1920, winfo_screenheight=lambda: 1080)
         with patch.object(self.ui, "_get_monitor_rects", return_value=[(-1920, -200, 0, 880), (0, 0, 1920, 1080)]):
             self.assertEqual(self.ui._position_on_available_screen(root, -263, -152, 365), (-365, -152, True))
-            self.assertEqual(self.ui._position_on_available_screen(root, 100, 900, 365), (100, 585, True))
+            self.assertEqual(self.ui._position_on_available_screen(root, 100, 900, 365),
+                             (100, 1080-self.ui.display_size(self.ui.WIDGET_H), True))
 
     def test_failed_setting_replace_preserves_previous_selection(self):
         self.ui._save_widget_state(80, 120, True, False, "both", "memphis")
@@ -138,6 +171,39 @@ class MenuPersistenceTests(unittest.TestCase):
         self.assertEqual(widget.style, "memphis")
         self.assertTrue(style_menu.items[1].checked)
         self.assertFalse(style_menu.items[0].checked)
+
+    def test_liquid_animation_stops_at_deadline_and_reuses_canvas_image(self):
+        widget = self.open_widget()
+        widget.primary_left = 50
+        with patch.object(widget, "_system_animations_enabled", return_value=True):
+            widget._start_liquid_motion(previous=70)
+        self.assertIsNotNone(widget._liquid_after)
+        widget.root.after_cancel(widget._liquid_after)
+        with patch.object(self.ui.time, "monotonic", return_value=widget._liquid_started+2.3):
+            widget._liquid_tick()
+        self.assertIsNone(widget._liquid_after)
+        self.assertEqual(len(widget.canvas.find_all()), 1)
+
+    def test_reduced_motion_and_error_cancel_animation(self):
+        widget = self.open_widget()
+        widget.primary_left = 50
+        with patch.object(widget, "_system_animations_enabled", return_value=False):
+            widget._start_liquid_motion()
+        self.assertIsNone(widget._liquid_after)
+        with patch.object(widget, "_system_animations_enabled", return_value=True):
+            widget._start_liquid_motion()
+        self.assertIsNotNone(widget._liquid_after)
+        widget._apply_error()
+        self.assertIsNone(widget._liquid_after)
+
+    def test_hiding_card_cancels_pending_animation(self):
+        widget = self.open_widget()
+        widget.primary_left = 50
+        with patch.object(widget, "_system_animations_enabled", return_value=True):
+            widget._start_liquid_motion()
+        widget.minimize_to_tray()
+        self.assertIsNone(widget._liquid_after)
+        self.assertFalse(widget.widget_visible)
 
 
 if __name__ == "__main__":

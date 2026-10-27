@@ -1,29 +1,25 @@
 """Account-independent Pillow renderer for the two desktop card styles."""
 from datetime import datetime
 from functools import lru_cache
-from math import ceil, cos, radians, sin
+from math import ceil, cos, exp, pi, sin
 import time
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 DEFAULT_STYLE = "mondrian"
 STYLE_NAMES = {"mondrian": "蒙德里安", "memphis": "孟菲斯波点"}
-WIDTH_BOTH, WIDTH_SINGLE, HEIGHT = 292, 212, 396
+WIDTH_BOTH, WIDTH_SINGLE, HEIGHT = 464, 398, 284
 RENDER_SCALE = 4
 
 PALETTES = {
-    "mondrian": dict(bg="#FAF6E9", ink="#181919", muted="#54534B", track="#DED7C7",
-                     border="#171818", shadow="#171818", five="#D63B31",
-                     week_bg="#1643A1", week_ink="#FFF8E5", week_muted="#E2E9F6",
-                     week_track="#5478B9", week="#F6D244", month_bg="#F2CC3C",
-                     month_ink="#171818", month_muted="#414032", month_track="#D6AE32",
-                     month="#1848A8"),
-    "memphis": dict(bg="#F6EEDD", ink="#202333", muted="#535364", track="#D9CDB9",
-                    border="#202333", shadow="#2657AB", five="#CF413B",
-                    week_bg="#A6D5CC", week_ink="#202333", week_muted="#344E56",
-                    week_track="#7FB9B1", week="#214DA7", month_bg="#F4D445",
-                    month_ink="#202333", month_muted="#454330", month_track="#CDB83C",
-                    month="#136E6B"),
+    "mondrian": dict(bg="#FAF7EF", ink="#282B29", muted="#585F63", hero_bg="#F2ECE1",
+                     border="#333933", divider="#D5CFBB", five="#BE4035", wet="#FFFAF0",
+                     week_bg="#EDF1F6", week_track="#D9E1ED", week="#2453A1",
+                     month_bg="#F4E9CA", month_muted="#65572F"),
+    "memphis": dict(bg="#F6EEDD", ink="#25283B", muted="#555466", hero_bg="#F6EEDD",
+                    border="#25283B", divider="#25283B", five="#C8453E", wet="#FFFAF0",
+                    week_bg="#B9DCD3", week_track="#91BDB3", week="#2C54A5",
+                    month_bg="#F3D453", month_muted="#534622"),
 }
 
 
@@ -103,19 +99,19 @@ def _corner_mask(size, bounds, radii):
     return mask
 
 
-def render_card(*, style=DEFAULT_STYLE, mode="both", primary=None, weekly=None,
-                primary_reset=None, weekly_reset=None, monthly=None, activity="ready",
-                updated_at=None, error=False, now=None):
-    """Return a transparent, oversampled card; never queries an account or creates UI."""
-    style = normalize_style(style)
+@lru_cache(maxsize=4)
+def _card_layers(style, mode, primary, weekly, primary_date, primary_count,
+                 weekly_date, weekly_count, monthly_values, monthly_date,
+                 monthly_count, activity, updated, error):
+    """Cache text and static surfaces; animation only paints the hero-sized crop."""
     p = PALETTES[style]
-    now = time.time() if now is None else now
-    width = WIDTH_BOTH if mode == "both" else WIDTH_SINGLE
     s = RENDER_SCALE
+    width = WIDTH_BOTH if mode == "both" else WIDTH_SINGLE
     size = (width*s, HEIGHT*s)
-    edge, bottom = width-7, HEIGHT-7
-    radii = (7, 7, 7, 7) if style == "mondrian" else (7, 20, 7, 20)
-    border = 2.4 if style == "mondrian" else 1.6
+    edge, bottom = width-1, HEIGHT-1
+    border = 1.25 if style == "mondrian" else 1.5
+    radii = (15, 15, 15, 15) if style == "mondrian" else (10, 28, 10, 28)
+    header, split, footer, hero_right = 40, 151, 254, 164
     surface = Image.new("RGBA", size, p["bg"])
     draw = ImageDraw.Draw(surface)
 
@@ -126,142 +122,150 @@ def render_card(*, style=DEFAULT_STYLE, mode="both", primary=None, weekly=None,
         else:
             draw.rectangle(coords, fill=fill)
 
-    def text(x, y, value, color=None, size=12, bold=False, anchor="lm", numeric=False, max_width=None):
+    def text(x, y, value, color=None, size=12, bold=False, numeric=False,
+             anchor="lm", max_width=None, target=None):
+        painter = ImageDraw.Draw(target) if target is not None else draw
         font = _font(size, bold, numeric)
-        # Fit unusually long dates/balances while keeping ordinary labels large.
-        if max_width:
-            while draw.textlength(value, font=font) > max_width*s and size > 8:
-                size -= .5
-                font = _font(size, bold, numeric)
-        draw.text((round(x*s), round(y*s)), value, fill=color or p["ink"],
-                  font=font, anchor=anchor)
+        while max_width and painter.textlength(value, font=font) > max_width*s and size > 11:
+            size -= .5
+            font = _font(size, bold, numeric)
+        painter.text((round(x*s), round(y*s)), value, fill=color or p["ink"],
+                     font=font, anchor=anchor)
 
-    # Header: the original preview's red cell becomes a meaningful activity label.
-    header_y, section_y, footer_y = 42, 230, 359
     status = {"ready": "就绪", "working": "运行中", "closed": "未检测到", "error": "检测异常"}.get(activity, "未检测到")
-    if error:
-        status = "读取失败"
-    text(17, 22, "Codex", size=16, bold=True, numeric=True)
-    if style == "mondrian":
-        box((edge-77, 0, edge, header_y), "#BF2F2B")
-        box((edge-77, 0, edge-77+border, header_y), p["border"])
-        text(edge-38, 22, status, "#FFF8E8", size=11, anchor="mm")
+    status = "读取失败" if error else status
+    text(16, 20, "Codex", size=16, bold=True, numeric=True)
+    text(76, 21, "使用额度", p["muted"], size=11)
+    text(edge-16, 21, status, p["muted"], size=11, anchor="rm")
+    status_w = draw.textlength(status, font=_font(11))/s
+    box((edge-26-status_w, 18, edge-21-status_w, 23), "#426E54" if not error else p["five"], 2.5)
+    if style == "memphis":
+        for x in range(round(edge-91-status_w), round(edge-56-status_w), 7):
+            for y in (14, 21, 28):
+                draw.ellipse(((x-1)*s, (y-1)*s, (x+1)*s, (y+1)*s), fill=p["ink"])
+
+    left, right = hero_right+20, edge-18
+    if mode == "both":
+        box((hero_right, header, edge, split), p["week_bg"])
+        text(left, 65, "每周", size=13)
+        suffix = "% 剩余" if weekly is not None else "暂不可用"
+        suffix_w = draw.textlength(suffix, font=_font(11))/s
+        text(right, 68, suffix, p["muted"], size=11, anchor="rm")
+        text(right-suffix_w-4, 63, "—" if weekly is None else f"{weekly:.0f}",
+             size=30, numeric=True, anchor="rm")
+        box((left, 89, right, 102), p["week_track"], 6.5)
+        if weekly is not None and weekly > 0:
+            fill_width = (right-left)*max(0, min(100, weekly))/100
+            box((left, 89, left+fill_width, 102), p["week"], min(6.5, fill_width/2))
+        text(left, 119, weekly_date+" 重置" if weekly is not None else "等待额度数据",
+             p["muted"], size=11, max_width=right-left)
+        countdown = weekly_count + (" · 余量低于20%" if weekly is not None and weekly < 20 else "")
+        text(left, 137, countdown, p["muted"], size=11, max_width=right-left)
+
+    month_top = split if mode == "both" else header
+    box((hero_right, month_top, edge, footer), p["month_bg"])
+    if mode == "both":
+        box((hero_right, split, edge, split+border), p["divider"])
+    title_y = month_top+20
+    amount_y = month_top+51 if mode == "both" else month_top+78
+    text(left, title_y, "本月额度", size=13)
+    value = monthly_values[2] if monthly_values else None
+    label = "暂不可用" if value is None else f"剩余 {value:.0f}%"
+    text(right, title_y, label, p["month_muted"], size=11, anchor="rm")
+    if monthly_values is None:
+        text(left, amount_y, "额度暂不可用", size=18)
     else:
-        text(edge-13, 22, status, p["muted"], size=11, anchor="rm")
-        # Keep the pattern separate from text, including in single-gauge mode.
-        dot_start = 139 if mode == "both" else 94
-        for x in range(dot_start, dot_start+(34 if mode == "both" else 10), 7):
-            for y in (16, 23, 30):
-                draw.ellipse(((x-1.2)*s, (y-1.2)*s, (x+1.2)*s, (y+1.2)*s), fill=p["ink"])
-    box((0, header_y, edge, header_y+border), p["border"])
-
-    if mode in {"weekly", "both"}:
-        left = edge/2 if mode == "both" else 0
-        box((left, header_y+border, edge, section_y), p["week_bg"])
-        if mode == "both":
-            box((left, header_y, left+border, section_y), p["border"])
-
-    def gauge(cx, title, value, reset, is_weekly=False):
-        ink = p["week_ink"] if is_weekly else p["ink"]
-        muted = p["week_muted"] if is_weekly else p["muted"]
-        track = p["week_track"] if is_weekly else p["track"]
-        tint = p["week"] if is_weekly else p["five"]
-        if error:
-            value, reset = None, None
-        text(cx, 62, title, ink, size=13.5, anchor="mm")
-        cy, radius, stroke = 119, 46.5, 5.6
-
-        def arc(fraction, color):
-            if fraction <= 0:
-                return
-            end = 120 + 300*fraction
-            bounds = tuple(round(v*s) for v in (cx-radius-stroke/2, cy-radius-stroke/2,
-                                                cx+radius+stroke/2, cy+radius+stroke/2))
-            draw.arc(bounds, start=120, end=end, fill=color, width=round(stroke*s))
-            for angle in (120, end):
-                x, y = cx + radius*cos(radians(angle)), cy + radius*sin(radians(angle))
-                cap = stroke/2
-                draw.ellipse(((x-cap)*s, (y-cap)*s, (x+cap)*s, (y+cap)*s), fill=color)
-
-        arc(1, track)
-        if value is not None:
-            arc(max(0, min(100, value))/100, tint)
-        number = "—" if value is None else f"{value:.0f}"
-        number_width = draw.textlength(number, font=_font(29.5, True, True))/s
-        x = cx-(number_width+(13 if value is not None else 0))/2
-        text(x, 111, number, ink, size=29.5, bold=True, numeric=True)
-        if value is not None:
-            text(x+number_width+3, 117, "%", muted, size=12, numeric=True)
-        text(cx, 136, "暂不可用" if value is None else "剩余", muted, size=10.5, anchor="mm")
-        max_width = edge/(2 if mode == "both" else 1)-14
-        text(cx, 178, reset_date(reset, now=now, relative_day=not is_weekly), ink,
-             size=12, anchor="mm", max_width=max_width)
-        countdown = reset_countdown(reset, now=now)
-        if reset is not None and countdown not in {"等待额度更新", "等待重置时间"}:
-            countdown = "重置 · " + countdown
-        text(cx, 197, countdown, muted, size=10.5, anchor="mm", max_width=max_width)
-        if value is not None and value < 20:
-            box((cx-48, 211, cx+48, 224), ink, 3)
-            text(cx, 217, "余量低于 20%", p["week_bg"] if is_weekly else p["bg"], size=9, anchor="mm")
-
-    if mode in {"5h", "both"}:
-        gauge(edge/4 if mode == "both" else edge/2, "5 小时", primary, primary_reset)
-    if mode in {"weekly", "both"}:
-        gauge(edge*3/4 if mode == "both" else edge/2, "每周", weekly, weekly_reset, True)
-
-    # Monthly allowance stays a single progress bar under the gauges.
-    month = None if error else monthly
-    value = month.remaining_percent if month is not None else None
-    if style == "mondrian":
-        box((0, section_y, edge, footer_y), p["month_bg"])
-        box((0, section_y, edge, section_y+border), p["border"])
-        box((0, footer_y, edge, footer_y+border), p["border"])
-        left, right, top = 17, edge-17, 247
-    else:
-        bounds = (14, section_y+10, edge-14, footer_y-3)
-        mask = _corner_mask(size, bounds, (3, 16, 3, 16))
-        surface.paste(p["month_bg"], (0, 0, *size), mask)
-        left, right, top = 26, edge-26, 255
-    text(left, top, "本月额度", p["month_ink"], size=13)
-    text(right, top, "—" if value is None else f"剩余 {value:.0f}%", p["month_muted"],
-         size=10.5, anchor="rm")
-    if month is None:
-        text(left, top+30, "额度暂不可用", p["month_ink"], size=17)
-    else:
-        amount, total = f"{month.remaining:,.0f}", f" / {month.limit:,.0f}"
-        number_size = 25
-        total_width = draw.textlength(total, font=_font(11, numeric=True))/s
-        while draw.textlength(amount, font=_font(number_size, True, True))/s+total_width > right-left and number_size > 12:
+        amount, total, _ = monthly_values
+        number_size = 32
+        suffix = " / " + total
+        suffix_w = draw.textlength(suffix, font=_font(12, numeric=True))/s
+        while draw.textlength(amount, font=_font(number_size, numeric=True))/s+suffix_w > right-left and number_size > 12:
             number_size -= 1
-        text(left, top+29, amount, p["month_ink"], size=number_size, bold=True, numeric=True)
-        amount_width = draw.textlength(amount, font=_font(number_size, True, True))/s
-        text(left+amount_width, top+34, total, p["month_muted"], size=11, numeric=True)
-    bar_y = top+51
-    box((left, bar_y, right, bar_y+5), p["month_track"], 2.5 if style == "memphis" else 0)
-    if value is not None and value > 0:
-        fill_width = (right-left)*min(100, value)/100
-        box((left, bar_y, left+fill_width, bar_y+5), p["month"],
-            min(2.5, fill_width/2) if style == "memphis" else 0)
-    reset = month.resets_at if month else None
-    exact = reset_date(reset, now=now)
-    if reset is not None and exact != "重置时间未知":
-        exact += " 重置"
-    text(left, top+75, exact, p["month_ink"], size=11, max_width=right-left)
-    countdown = reset_countdown(reset, now=now)
-    if value is not None and value < 20:
-        countdown += " · 余量低于 20%"
-    text(left, top+91, countdown, p["month_muted"], size=10.5, max_width=right-left)
+        text(left, amount_y, amount, size=number_size, numeric=True)
+        amount_w = draw.textlength(amount, font=_font(number_size, numeric=True))/s
+        text(left+amount_w, amount_y+5, suffix, p["month_muted"], size=12, numeric=True)
+    text(left, footer-28, monthly_date+" 重置" if monthly_values else "等待额度数据",
+         p["month_muted"], size=11, max_width=right-left)
+    countdown = monthly_count + (" · 余量低于20%" if value is not None and value < 20 else "")
+    text(left, footer-11, countdown, p["month_muted"], size=11, max_width=right-left)
 
-    updated = datetime.fromtimestamp(updated_at).strftime("%H:%M") if updated_at else "--:--"
-    text(17, 375, "读取失败 · 请刷新" if error else f"更新 {updated}", p["muted"], size=10)
-    text(edge-15, 375, "本机时区", p["muted"], size=10, anchor="rm")
+    box((0, header, edge, header+border), p["border"])
+    box((hero_right, header, hero_right+border, footer), p["border"])
+    box((0, footer, edge, footer+border), p["divider"])
+    text(15, 269, "读取失败 · 请刷新" if error else f"更新 {updated}", p["muted"], size=11)
+    text(edge-15, 269, "本机时区", p["muted"], size=11, anchor="rm")
 
-    outer = _corner_mask(size, (1, 1, edge, bottom), radii)
-    inner = _corner_mask(size, (1+border, 1+border, edge-border, bottom-border),
+    # Both ink layers have identical glyph geometry. The same liquid mask clips
+    # the fill and light ink, keeping text readable as the waterline crosses it.
+    bounds = tuple(round(v*s) for v in (border, header+border, hero_right, footer))
+    hero_size = (bounds[2]-bounds[0], bounds[3]-bounds[1])
+    dry = Image.new("RGBA", hero_size)
+    wet = Image.new("RGBA", hero_size)
+    hero_value = weekly if mode == "weekly" else primary
+    hero_date = weekly_date if mode == "weekly" else primary_date
+    hero_count = weekly_count if mode == "weekly" else primary_count
+    for layer, color in ((dry, p["ink"]), (wet, p["wet"])):
+        text(16, 23, "每周" if mode == "weekly" else "5 小时", color, size=14, target=layer)
+        number = "—" if hero_value is None else f"{hero_value:.0f}"
+        text(13, 79, number, color, size=48, bold=True, numeric=True, target=layer)
+        number_w = draw.textlength(number, font=_font(48, True, True))/s
+        if hero_value is not None:
+            text(16+number_w, 91, "%", color, size=14, numeric=True, target=layer)
+        label = "暂不可用" if hero_value is None else ("余量低于20%" if hero_value < 20 else "剩余额度")
+        text(16, 112, label, color, size=11, target=layer)
+        if draw.textlength(hero_date, font=_font(12)) > (hero_size[0]/s-27)*s:
+            parts = hero_date.rsplit(" ", 1)
+            text(16, 159, parts[0], color, size=11, target=layer)
+            text(16, 177, parts[-1] if len(parts) == 2 else "", color, size=12, target=layer)
+        else:
+            text(16, 177, hero_date, color, size=12, target=layer)
+        text(16, 197, hero_count, color, size=11, target=layer)
+
+    outer = _corner_mask(size, (0, 0, edge, bottom), radii)
+    inner = _corner_mask(size, (border, border, edge-border, bottom-border),
                          tuple(max(0, r-border) for r in radii))
     surface.paste(p["border"], (0, 0, *size), ImageChops.subtract(outer, inner))
-    result = Image.new("RGBA", size)
-    shadow = _corner_mask(size, (6, 6, edge+5, bottom+5), radii)
-    result.paste(p["shadow"], (0, 0, *size), shadow)
-    result.paste(surface, (0, 0), outer)
+    return surface, dry, wet, outer, bounds
+
+
+def render_card(*, style=DEFAULT_STYLE, mode="both", primary=None, weekly=None,
+                primary_reset=None, weekly_reset=None, monthly=None, activity="ready",
+                updated_at=None, error=False, now=None, wave_time=0, liquid_percent=None):
+    """Render the real card at 4× resolution. No account access and no offset shadow."""
+    style = normalize_style(style)
+    mode = mode if mode in {"both", "5h", "weekly"} else "both"
+    p = PALETTES[style]
+    now = time.time() if now is None else now
+    if error:
+        primary = weekly = monthly = None
+        primary_reset = weekly_reset = None
+    monthly_values = None if monthly is None else (
+        f"{monthly.remaining:,.0f}", f"{monthly.limit:,.0f}", monthly.remaining_percent)
+    monthly_reset = monthly.resets_at if monthly else None
+    layers = _card_layers(style, mode, primary, weekly,
+        reset_date(primary_reset, now=now, relative_day=True), reset_countdown(primary_reset, now=now),
+        reset_date(weekly_reset, now=now), reset_countdown(weekly_reset, now=now), monthly_values,
+        reset_date(monthly_reset, now=now), reset_countdown(monthly_reset, now=now), activity,
+        datetime.fromtimestamp(updated_at).strftime("%H:%M") if updated_at else "--:--", error)
+    base, dry, wet, outer, bounds = layers
+    value = weekly if mode == "weekly" else primary
+    if liquid_percent is not None and value is not None:
+        value = liquid_percent
+    percent = 0 if value is None else max(0, min(100, float(value)))
+    w, h = dry.size
+    level = h*(1-percent/100)
+    amp = 0 if wave_time <= 0 or wave_time >= 2.2 else 5*RENDER_SCALE*exp(-wave_time/.55)*min(1, wave_time/.07)
+    amp = min(amp, level, h-level)
+    points = [(w*i/64, level+amp*(cos(i*pi/64)*sin(wave_time/.175)*.75+
+                                  sin(i*pi/32+wave_time/.175)*.25)) for i in range(65)]
+    mask = Image.new("L", (w, h), 0)
+    if percent > 0:
+        ImageDraw.Draw(mask).polygon(points+[(w, h), (0, h)], fill=255)
+    hero = Image.new("RGBA", (w, h), p["hero_bg"])
+    hero.paste(p["week"] if mode == "weekly" else p["five"], (0, 0, w, h), mask)
+    hero.alpha_composite(dry)
+    hero.paste(wet, (0, 0), ImageChops.multiply(wet.getchannel("A"), mask))
+    result = base.copy()
+    result.paste(hero, bounds[:2])
+    result.putalpha(outer)
     return result

@@ -1,4 +1,5 @@
 """Render both shipping styles with deterministic synthetic data; no account access."""
+import ast
 from datetime import datetime
 from pathlib import Path
 import sys
@@ -21,9 +22,13 @@ def sample_data():
 
 
 def main():
+    config = ast.parse((root / "codex_usage_widget.py").read_text(encoding="utf-8-sig"))
+    scale = next(ast.literal_eval(node.value) for node in config.body
+                 if isinstance(node, ast.Assign)
+                 and any(isinstance(target, ast.Name) and target.id == "UI_SCALE" for target in node.targets))
     for style, filename in (("mondrian", "preview.png"), ("memphis", "preview-memphis.png")):
         image = render_card(style=style, **sample_data())
-        image = image.resize((round(WIDTH_BOTH*1.25), round(HEIGHT*1.25)), Image.Resampling.LANCZOS)
+        image = image.resize((round(WIDTH_BOTH*scale), round(HEIGHT*scale)), Image.Resampling.LANCZOS)
         destination = root / "assets" / filename
         destination.parent.mkdir(exist_ok=True)
         image.save(destination)

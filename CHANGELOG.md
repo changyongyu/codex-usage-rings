@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-10-27 — Horizontal liquid allowance cards
+
+- Replace the dual rings with a full-cell liquid hero, a soft weekly progress strip and a large monthly balance.
+- Ship matching Mondrian and Memphis Polka Dots palettes without offset shadows; keep saved style and position settings.
+- Use a 464 × 284 default card at 1.00 scale, retaining exact reset dates, countdowns and unavailable/low-allowance states.
+- Animate only brief changes and drag releases; respect Windows reduced-motion preferences and stop timers on hide, errors and exit.
+- Cache static drawing layers and reuse the canvas image to keep animation bounded and idle rendering quiet.
+
 ## 2026-10-26 — Switchable desktop styles
 
 - Ship Mondrian and Memphis Polka Dots with matching card and tray style menus.

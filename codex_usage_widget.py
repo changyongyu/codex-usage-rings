@@ -85,7 +85,7 @@ _ACTIVITY_WAITING_EVENT_TYPES = {
 WIDGET_W_BOTH = WIDTH_BOTH
 WIDGET_W_SINGLE = WIDTH_SINGLE
 WIDGET_H = HEIGHT
-UI_SCALE = 1.25
+UI_SCALE = 1.00
 
 
 def display_size(value):
@@ -722,6 +722,10 @@ class CodexOverlay:
         self.tray_limit_mode = "5h"
         self.tray_click_lock = threading.Lock()
         self.tray_click_timer = None
+        self._liquid_after = None
+        self._liquid_started = 0.0
+        self._liquid_source = None
+        self._drag_moved = False
 
         self._build_ui()
         self._start_tray_icon()
@@ -730,7 +734,8 @@ class CodexOverlay:
         self._start_activity_monitor()
         self._start_polling()
         self.root.after(30000, self._tick_clock)
-        logging.info("CodexOverlay initialized.")
+        logging.info("CodexOverlay initialized: size=%sx%s style=%s.",
+                     display_size(self.widget_w), display_size(WIDGET_H), self.style)
 
     def _build_ui(self):
         logging.debug("Building widget UI.")
@@ -763,7 +768,7 @@ class CodexOverlay:
             label="仅每周", value="weekly", variable=self.display_mode_var, command=self.change_display_mode
         )
         display_menu.add_radiobutton(
-            label="双圆环", value="both", variable=self.display_mode_var, command=self.change_display_mode
+            label="全部额度", value="both", variable=self.display_mode_var, command=self.change_display_mode
         )
         self.menu.add_cascade(label="显示模式", menu=display_menu)
         style_menu = tk.Menu(self.menu, tearoff=0)
@@ -771,6 +776,7 @@ class CodexOverlay:
             style_menu.add_radiobutton(label=label, value=key, variable=self.style_var,
                                        command=self.change_style)
         self.menu.add_cascade(label="展示风格", menu=style_menu)
+        self.menu.add_command(label="轻晃液面", command=self._start_liquid_motion)
         self.menu.add_separator()
         self.menu.add_command(label="收起到托盘", command=self.minimize_to_tray)
         self.menu.add_command(label="退出", command=self.quit)
@@ -823,6 +829,7 @@ class CodexOverlay:
             _save_widget_state(x, y, self.locked, self.always_on_top, self.display_mode, self.style)
 
     def _drag_start(self, event):
+        self._drag_moved = False
         if self.locked:
             return
         self.drag_offset_x = event.x_root - self.root.winfo_x()
@@ -833,12 +840,16 @@ class CodexOverlay:
             return
         x = event.x_root - self.drag_offset_x
         y = event.y_root - self.drag_offset_y
+        self._drag_moved = True
         self.root.geometry(f"+{x}+{y}")
 
     def _drag_end(self, event):
         if self.locked:
             return
         self._save_state()
+        if self._drag_moved:
+            self._start_liquid_motion()
+            self._drag_moved = False
 
     def toggle_lock(self):
         self.locked = not self.locked
@@ -890,6 +901,7 @@ class CodexOverlay:
 
 
     def change_style(self, style=None):
+        self._stop_liquid_motion()
         self.style = normalize_style(self.style_var.get() if style is None else style)
         self.style_var.set(self.style)
         self._save_state()
@@ -909,6 +921,7 @@ class CodexOverlay:
         new_mode = self.display_mode_var.get()
         if new_mode not in {"5h", "weekly", "both"}:
             return
+        self._stop_liquid_motion()
         self.display_mode = new_mode
         self.widget_w = WIDGET_W_BOTH if new_mode == "both" else WIDGET_W_SINGLE
         if new_mode == "5h":
@@ -1077,6 +1090,7 @@ class CodexOverlay:
 
     def minimize_to_tray(self):
         logging.info("Minimizing widget to tray.")
+        self._stop_liquid_motion()
         self._save_state()
         self.widget_visible = False
         self.root.withdraw()
@@ -1106,6 +1120,7 @@ class CodexOverlay:
 
     def _apply_data(self, data: dict):
         logging.debug("Applying usage data to UI: %s.", data)
+        previous = None if self.error else self._hero_remaining()
         primary = data.get("primary") or {}
         secondary = data.get("secondary") or {}
         primary_left = primary.get("remaining_percent")
@@ -1128,33 +1143,84 @@ class CodexOverlay:
         self.weekly_reset = data.get("secondary_reset_time", "--/-- --:--")
         self._draw()
         self._update_tray_icon()
+        current = self._hero_remaining()
+        if previous is not None and current is not None and previous != current:
+            self._start_liquid_motion(previous)
 
     def _apply_error(self):
         logging.info("Showing error state in widget.")
+        self._stop_liquid_motion()
         self.error = True
         self._draw()
         self._update_tray_icon()
 
-    def _draw(self):
-        self.canvas.delete("all")
+    def _hero_remaining(self):
+        return self.weekly_left if self.display_mode == "weekly" else self.primary_left
+
+    @staticmethod
+    def _system_animations_enabled():
+        """Respect Windows' accessibility preference for client-area animation."""
+        try:
+            enabled = wintypes.BOOL(True)
+            if ctypes.windll.user32.SystemParametersInfoW(0x1042, 0, ctypes.byref(enabled), 0):
+                return bool(enabled.value)
+        except (AttributeError, OSError):
+            pass
+        return True
+
+    def _stop_liquid_motion(self):
+        if self._liquid_after is not None:
+            self.root.after_cancel(self._liquid_after)
+            self._liquid_after = None
+
+    def _start_liquid_motion(self, previous=None):
+        self._stop_liquid_motion()
+        current = self._hero_remaining()
+        if (self.stop_event.is_set() or not self.widget_visible or self.error
+                or current is None or not self._system_animations_enabled()):
+            return
+        self._liquid_source = current if previous is None else previous
+        self._liquid_started = time.monotonic()
+        self._liquid_tick()
+
+    def _liquid_tick(self):
+        self._liquid_after = None
+        if self.stop_event.is_set() or not self.widget_visible:
+            return
+        current = self._hero_remaining()
+        elapsed = time.monotonic()-self._liquid_started
+        if elapsed >= 2.2 or current is None or self.error:
+            self._draw()
+            return
+        progress = 1-(1-min(1, elapsed/.8))**3
+        visual = self._liquid_source+(current-self._liquid_source)*progress
+        self._draw(wave_time=elapsed, liquid_percent=visual)
+        # Idle cards have no animation timer. Only a short, bounded burst is rendered.
+        self._liquid_after = self.root.after(40, self._liquid_tick)
+
+    def _draw(self, *, wave_time=0, liquid_percent=None):
         image = render_card(
             style=self.style, mode=self.display_mode,
             primary=self.primary_left, weekly=self.weekly_left,
             primary_reset=self.primary_reset_at, weekly_reset=self.weekly_reset_at,
             monthly=self.monthly, activity=self.activity_status,
             updated_at=self.updated_at, error=self.error,
+            wave_time=wave_time, liquid_percent=liquid_percent,
         )
         self._show_rendered(image)
 
     def _show_rendered(self, image: Image.Image):
         size = (display_size(self.widget_w), display_size(WIDGET_H))
         image = image.resize(size, Image.Resampling.LANCZOS)
-        # Tk uses a color key on Windows; keep the rounded silhouette and hard shadow.
+        # Tk uses a color key on Windows; preserve the shadow-free rounded silhouette.
         keyed = Image.new("RGB", size, TRANSPARENT)
         mask = image.getchannel("A").point(lambda alpha: 255 if alpha >= 128 else 0)
         keyed.paste(image.convert("RGB"), (0, 0), mask)
         self.rendered_image = ImageTk.PhotoImage(keyed, master=self.root)
-        self.canvas.create_image(0, 0, image=self.rendered_image, anchor="nw")
+        if getattr(self, "canvas_image_id", None) is None:
+            self.canvas_image_id = self.canvas.create_image(0, 0, image=self.rendered_image, anchor="nw")
+        else:
+            self.canvas.itemconfig(self.canvas_image_id, image=self.rendered_image)
 
     def refresh_now(self):
         logging.info("Manual refresh requested.")
@@ -1189,6 +1255,7 @@ class CodexOverlay:
 
     def quit(self):
         logging.info("Quit requested.")
+        self._stop_liquid_motion()
         (Path(os.environ.get("LOCALAPPDATA", Path.home())) / "CodexUsageRings").mkdir(parents=True, exist_ok=True)
         (Path(os.environ.get("LOCALAPPDATA", Path.home())) / "CodexUsageRings" / "stop.requested").touch()
         self.stop_event.set()
